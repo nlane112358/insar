@@ -1,0 +1,3 @@
+/Users/nlane/workspace/storage/insar/build/CMakeFiles/insar_proto.dir
+/Users/nlane/workspace/storage/insar/build/CMakeFiles/edit_cache.dir
+/Users/nlane/workspace/storage/insar/build/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/nlane/workspace/storage/insar/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
