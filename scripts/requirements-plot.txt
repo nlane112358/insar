@@ -1,0 +1,4 @@
+# Optional plotting extras: Crameri palettes and Pillow-backed GIF export.
+matplotlib>=3.7
+cmcrameri>=1.8
+Pillow>=9.0

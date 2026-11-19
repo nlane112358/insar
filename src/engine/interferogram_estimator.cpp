@@ -19,18 +19,45 @@ size_t InterferogramEstimator::compute(
     std::vector<uint8_t>& valid_mask) const
 {
     pair.validate();
-    if (out_w <= 0 || out_h <= 0 || stride_x <= 0 || stride_y <= 0 || look_rx < 0 || look_ry < 0) {
+    return compute(
+        pair.reference.pixels().data(),
+        pair.secondary.pixels().data(),
+        pair.width(),
+        pair.height(),
+        out_w,
+        out_h,
+        stride_x,
+        stride_y,
+        look_rx,
+        look_ry,
+        wrapped,
+        coherence,
+        valid_mask);
+}
+
+size_t InterferogramEstimator::compute(
+    const Complex* slc1,
+    const Complex* slc2,
+    int in_w,
+    int in_h,
+    int out_w,
+    int out_h,
+    int stride_x,
+    int stride_y,
+    int look_rx,
+    int look_ry,
+    std::vector<float>& wrapped,
+    std::vector<float>& coherence,
+    std::vector<uint8_t>& valid_mask) const
+{
+    if (!slc1 || !slc2 || in_w <= 0 || in_h <= 0 || out_w <= 0 || out_h <= 0 ||
+        stride_x <= 0 || stride_y <= 0 || look_rx < 0 || look_ry < 0) {
         throw std::invalid_argument("InterferogramEstimator received invalid output or stride parameters");
     }
     const size_t out_n = static_cast<size_t>(out_w) * out_h;
     if (wrapped.size() < out_n || coherence.size() < out_n || valid_mask.size() < out_n) {
         throw std::invalid_argument("InterferogramEstimator output buffer size mismatch");
     }
-    const int in_w = pair.width();
-    const int in_h = pair.height();
-    const auto& slc1 = pair.reference.pixels();
-    const auto& slc2 = pair.secondary.pixels();
-
     const int rx = std::max(look_rx, stride_x / 2);
     const int ry = std::max(look_ry, stride_y / 2);
     const int min_samples = std::max(1, ((2 * rx + 1) * (2 * ry + 1)) / 4);

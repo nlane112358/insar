@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insar-platform"
+version = "0.5.0"
+description = "InSAR processing control plane, worker, and domain services"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "celery[redis]>=5.4.0",
+    "psycopg[binary]>=3.2.0",
+    "boto3>=1.35.0",
+]
+
+[project.optional-dependencies]
+native = [
+    "nanobind>=2.5.0,<4",
+]
+ingest = [
+    "asf_search>=14.0.0",
+    "earthaccess>=0.19.0",
+    "h5py>=3.12.0",
+]
+reports = [
+    "numpy>=2.1.0",
+    "matplotlib>=3.9.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+insarctl = "cli.insarctl:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["services*", "api*", "cli*", "scripts*"]

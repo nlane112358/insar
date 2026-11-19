@@ -338,13 +338,34 @@ class TestAutoIngestUnit(unittest.TestCase):
     def test_example_sites_config_loads(self) -> None:
         example_cfg = SCRIPTS_DIR / "sites.example.json"
         sites = ai.load_sites_config(example_cfg)
-        self.assertEqual([s.site_id for s in sites], ["mexico_city_iw1", "west_yorkshire_nisar"])
+        self.assertEqual(
+            [s.site_id for s in sites],
+            [
+                "mexico_city_iw1",
+                "west_yorkshire_nisar",
+                "london_thames_nisar",
+                "london_east_nisar_t173",
+                "east_midlands_coalfields_nisar",
+                "east_midlands_coalfields_t052",
+            ],
+        )
         self.assertEqual(sites[0].sensor, "opera")
         self.assertEqual(sites[1].sensor, "nisar")
         self.assertEqual(sites[1].bbox, (-1.85, 53.55, -1.70, 53.68))
         self.assertEqual(sites[1].track, 52)
         self.assertEqual(sites[1].frame, 61)
         self.assertTrue(sites[1].stream)
+        by_id = {s.site_id: s for s in sites}
+        self.assertEqual(by_id["london_thames_nisar"].track, 101)
+        self.assertEqual(by_id["london_thames_nisar"].frame, 28)
+        self.assertEqual(by_id["london_thames_nisar"].direction, "ASCENDING")
+        self.assertEqual(by_id["london_thames_nisar"].ref_lonlat, (-0.5594, 51.6772))
+        self.assertEqual(by_id["london_east_nisar_t173"].track, 173)
+        self.assertEqual(by_id["london_east_nisar_t173"].max_skip, 1)
+        self.assertEqual(by_id["east_midlands_coalfields_nisar"].track, 101)
+        self.assertEqual(by_id["east_midlands_coalfields_nisar"].ref_lonlat, (-1.0781, 52.879))
+        self.assertEqual(by_id["east_midlands_coalfields_t052"].track, 52)
+        self.assertEqual(by_id["east_midlands_coalfields_t052"].direction, "DESCENDING")
 
     def test_opera_hyphen_burst_id_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as td:

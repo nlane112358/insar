@@ -63,6 +63,7 @@ ASSET_CLASS_COLORS: dict[str, str] = {
     "river": "#2B7BBA",
     "reservoir": "#633974",
     "dam": "#4A235A",
+    "water_works": "#0E7490",
     "airport_runway": "#2C3E50",
     "infrastructure": "#627282",
 }
@@ -77,6 +78,7 @@ ASSET_CLASS_LABELS: dict[str, str] = {
     "river": "River",
     "reservoir": "Reservoir",
     "dam": "Dam",
+    "water_works": "Water Works (AMP8)",
     "airport_runway": "Runway",
     "infrastructure": "Infrastructure",
 }
@@ -135,7 +137,16 @@ def configure_matplotlib() -> Any:
 
 
 def make_diverging_cmap() -> Any:
-    """Perceptually balanced cool-ivory-crimson diverging colormap centered cleanly at zero."""
+    """Return Crameri's perceptually uniform vik map, with a built-in fallback."""
+    try:
+        from cmcrameri import cm as cmc
+
+        cmap = cmc.vik.copy()
+        cmap.name = "insar_vik"
+        return cmap
+    except ImportError:
+        pass
+
     from matplotlib.colors import LinearSegmentedColormap
 
     stops = [
@@ -303,7 +314,8 @@ def parse_iso_date(s: str) -> date:
 
 def format_site_label(stack_dir: Path, ledger: dict[str, Any]) -> str:
     raw = stack_dir.name.replace("_", " ").strip()
-    pretty = " ".join(w.upper() if w.lower() in {"iw1", "iw2", "iw3", "nisar", "t052", "t029"} else w.title() for w in raw.split())
+    upper_tokens = {"iw1", "iw2", "iw3", "nisar", "uk", "amp8", "t023", "t029", "t052", "t101", "t173"}
+    pretty = " ".join(w.upper() if w.lower() in upper_tokens else w.title() for w in raw.split())
     stream = ledger.get("stream_key")
     return f"{pretty} ({stream})" if stream else pretty
 

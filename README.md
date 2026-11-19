@@ -31,7 +31,7 @@ Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stackin
 
 ![Line-of-Sight Surface Velocity — Mexico City IW1](docs/figures/mexico_city_iw1_velocity_map.png)
 
-*24 consecutive OPERA CSLC-S1 pairs (19 Jun – 17 Nov 2026, 145 stacked days), connected-component bedrock reference pinning, two-pass adaptive high-deformation masking, Copernicus GLO-30 DEM tropospheric regression, coherence-modulated shading, and 100 m buffered Metro, Rail, and Motorway corridor overlays with $|v|/\sigma_v \ge 2.5$ SNR gating (suppressing false-positive critical alerts across incoherent mountain unwrapping boundaries while preserving true clay-basin alerts on Línea VK, Línea A, Línea B, and Circuito Interior).*
+*24 consecutive OPERA CSLC-S1 pairs (19 Jun – 17 Nov 2026, 145 stacked days), connected-component bedrock reference pinning, two-pass adaptive high-deformation masking, Copernicus GLO-30 DEM tropospheric regression, DEM hillshade blended into velocity luminance, confidence-weighted opacity, and 100 m buffered Metro, Rail, and Motorway corridor overlays with $|v|/\sigma_v \ge 2.5$ SNR gating (suppressing false-positive critical alerts across incoherent mountain unwrapping boundaries while preserving true clay-basin alerts on Línea VK, Línea A, Línea B, and Circuito Interior).*
 
 ### West Yorkshire — NISAR L-Band (`NISAR_T052_F061_D`)
 
@@ -47,25 +47,105 @@ Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stackin
 
 *Pair-level outputs for `NISAR_T052_F061_D_2026-10-27_2026-11-08`: wrapped interferometric phase $\psi \in [-\pi, \pi]$, spatial coherence $\gamma \in [0, 1]$, and unwrapped LOS displacement (mm) with high-coherence anomaly alerts.*
 
+### Extended Stack Visualizations
+
+Additional figures are generated from the checked-in stack, corridor, GNSS, DEM, and NISAR pair products:
+
+| Figure | Contents |
+| :--- | :--- |
+| [`mexico_city_corridor_heatmap.png`](docs/figures/mexico_city_corridor_heatmap.png) | Corridor p95 absolute LOS velocity by acquisition date; label color shows the latest risk class. |
+| [`mexico_city_stack_evolution.png`](docs/figures/mexico_city_stack_evolution.png) · [`mexico_city_stack_evolution.gif`](docs/figures/mexico_city_stack_evolution.gif) | Nine static snapshots plus a pass-by-pass animation synchronized to the selected GNSS station's LOS displacement series. |
+| [`mexico_city_velocity_confidence.png`](docs/figures/mexico_city_velocity_confidence.png) | Significant LOS velocity, velocity SNR, and standard error. |
+| [`mexico_city_velocity_gradient.png`](docs/figures/mexico_city_velocity_gradient.png) | Engineering view of LOS velocity gradients in mm/yr per 100 m with rail, metro, road, and water corridors. |
+| [`mexico_city_velocity_hillshade.png`](docs/figures/mexico_city_velocity_hillshade.png) | Velocity with DEM relief blended into the luminance channel and confidence-weighted opacity. |
+| [`mexico_city_basin_transect.png`](docs/figures/mexico_city_basin_transect.png) | Smoothed velocity, cumulative displacement, elevation, and coherence from the bedrock reference to MMX1. |
+| [`mexico_city_gnss_residuals.png`](docs/figures/mexico_city_gnss_residuals.png) | Station residual map plus residual relationships with coherence and InSAR spatial spread. |
+| [`west_yorkshire_nisar_track_comparison.png`](docs/figures/west_yorkshire_nisar_track_comparison.png) | T052 and T029 pair displacement and coherence in their respective LOS geometries. |
+
+![Mexico City stack evolution synchronized with MMX1 GNSS validation](docs/figures/mexico_city_stack_evolution.gif)
+
+Regenerate the extended figures that use existing exports with:
+
+```bash
+python3 scripts/plots/plot_extended_visualizations.py
+```
+
+The stack evolution plot replays the stack into a temporary directory to capture corrected per-epoch rasters:
+
+```bash
+python3 scripts/plots/plot_stack_evolution.py
+```
+
+The replay reads settings from `stack_ledger.json`, writes the static panel and synchronized GIF by default, and leaves the existing stack outputs untouched. It uses the selected station's `.tenv3` file and LOS vector from the validation CSV; pass `--no-animation` to render only the static panel.
+
+Install the optional scientific colormaps and GIF writer with:
+
+```bash
+python3 -m pip install -r scripts/requirements-plot.txt
+```
+
+The diverging maps fall back to the built-in palette if `cmcrameri` is unavailable. GIF export requires Pillow; use an `.mp4` output path when FFmpeg is installed.
+
+### Interactive site reports
+
+- [Mexico City · Sentinel-1 C-band](docs/interactive/mexico_city.html)
+- [West Yorkshire · NISAR L-band](docs/interactive/west_yorkshire.html)
+
+Each HTML embeds its stack COGs and feature data for building-scale zoom and corridor/station popups. The map libraries and basemap tiles are loaded from public CDNs.
+
 ---
 
 ## Architecture
 
 | Component | Path | Role |
 | :--- | :--- | :--- |
-| **Pair Engine** | [`src/engine/`](src/engine) · `insar_proto` | Coregistered OPERA CSLC-S1 / NISAR GSLC / GeoTIFF ingestion, fused boxcar interferogram & coherence, $\gamma^3$-weighted PCG phase unwrapping with exact mirrored-2D-FFT Neumann preconditioner, stable reference region pinning (`--ref-lonlat` / `--ref-px`), COG + STAC + GeoJSON alert export |
-| **Online Stacker** | [`src/insar_stack_cpu.cpp`](src/insar_stack_cpu.cpp) · `insar_stack` | $O(1)$ per-pass updates to a 13-band Float64 sufficient-statistics raster (`stack_state.tif`), connected-component reference pinning, explicit/two-pass high-deformation masking, joint robust polynomial + DEM tropospheric regression (`--dem`), skip-1/skip-2 triplet phase closure masking & corrupted-pair rejection, velocity/uncertainty/SNR/acceleration COGs, and SNR + stack-maturity gated corridor risk analytics |
-| **Ingestion** | [`scripts/auto_ingest.py`](scripts/auto_ingest.py) | Automated Sentinel-1 OPERA & NISAR L-band discovery, `--max-skip {0,1,2}` redundant pair network generation, SQLite state tracking, and dispatch to `insar_proto` + `insar_stack` |
-| **Stack Runner** | [`scripts/stack_timeseries.py`](scripts/stack_timeseries.py) | Chronological + skip-pair network discovery, automatic closure triplet assembly, two-pass high-deformation masking, and incremental `insar_stack` dispatch |
-| **DEM & GNSS Validation** | [`scripts/fetch_dem.py`](scripts/fetch_dem.py) · [`scripts/validate_gnss.py`](scripts/validate_gnss.py) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
-| **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) | Standalone publication maps for `velocity`, `cumulative`, `coherence`, `uncertainty`, and `acceleration` layers |
-| **Unified OEM API & Docker** | [`api/server.py`](api/server.py) · [`Dockerfile`](Dockerfile) · [`sdk/demo_client.py`](sdk/demo_client.py) | FastAPI service unifying `insar_proto` (`/v1/jobs`) and `insar_stack` (`/v1/stacks/{stack_id}/updates`, `/v1/stacks`), STAC 1.1.0 pair & stack items, Range-streamable COGs, `/health`, and HMAC-SHA256 webhooks; multi-stage Docker container bundling both C++ binaries |
+| **Shared C++ Core** | [`include/insar/`](include/insar) · [`src/`](src) · [`bindings/python_module.cpp`](bindings/python_module.cpp) | `libinsar` shared library with pairwise and stack APIs; nanobind runs the full applications in-process and exposes a zero-copy CPU NumPy/DLPack interferogram kernel |
+| **Online Stacker** | [`src/stack/`](src/stack) · `insar_stack` | $O(1)$ per-pass updates to a 13-band Float64 sufficient-statistics raster (`stack_state.tif`), connected-component reference pinning, explicit/two-pass high-deformation masking, joint robust polynomial + DEM tropospheric regression (`--dem`), skip-1/skip-2 triplet phase closure masking & corrupted-pair rejection, velocity/uncertainty/SNR/acceleration COGs, and SNR + stack-maturity gated corridor risk analytics |
+| **Platform Domain Services** | [`services/platform/`](services/platform) | Provider adapters, ingestion and stack services, GNSS validation, STAC builders, object storage, database, and durable workflow boundaries; legacy `scripts/` commands remain compatibility shims |
+| **Control Plane** | [`api/server.py`](api/server.py) | FastAPI monitor/job/stack APIs, PostGIS spatial screening, STAC catalog, S3 range reads, API key checks, and transactional outbox enqueueing |
+| **Compute Plane** | [`services/worker/`](services/worker) · [`services/platform/workflows/`](services/platform/workflows) | Celery workers execute typed ingestion, pairwise, and stack tasks; Redis-backed scheduling retries work after transient failures |
+| **State & Artifacts** | [`services/platform/storage/`](services/platform/storage) · [`docker-compose.yml`](docker-compose.yml) | PostGIS is the system of record; MinIO/S3 stores artifact objects and checksums; SQLite/filesystem mode remains available for a standalone developer run |
+| **DEM & GNSS Validation** | [`services/platform/catalog/dem_service.py`](services/platform/catalog/dem_service.py) · [`services/platform/validation/`](services/platform/validation) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
+| **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) · [`scripts/plots/plot_extended_visualizations.py`](scripts/plots/plot_extended_visualizations.py) · [`scripts/plots/plot_stack_evolution.py`](scripts/plots/plot_stack_evolution.py) | Standalone raster maps, corridor heatmaps, confidence diagnostics, GNSS residuals, transects, track comparisons, and replayed stack evolution panels |
+| **Interactive Maps** | [`scripts/plots/export_interactive_map.py`](scripts/plots/export_interactive_map.py) · [`api/server.py`](api/server.py) | Embedded-COG reports with basemap toggle, opacity and swipe controls, clickable corridor/GNSS charts, and live job previews at `/preview/{job_id}` |
+| **Operator CLI** | [`cli/insarctl.py`](cli/insarctl.py) | Thin commands for Compose lifecycle, health and screening queries, monitor sync, and legacy local scientific commands |
 
 ---
 
 ## Quickstart
 
 **Prerequisites:** CMake $\ge$ 3.18, a C++20 compiler (OpenMP optional), GDAL, and Python 3 (`fastapi`, `uvicorn`, `httpx`, `pydantic` for the API; `numpy`, `matplotlib`, and `osgeo` for plotting & GNSS validation).
+
+### Local production-style stack
+
+The Compose stack starts PostGIS, Redis, MinIO, the API, a C++ compute worker, and the outbox scheduler. Copy `.env.example` to `.env`, set local API and webhook secrets (and Earthdata credentials when required), then run:
+
+```bash
+cp .env.example .env
+set -a; source .env; set +a
+docker compose up -d --build
+python3 -m pip install -e .
+insarctl health
+```
+
+The `ingest` Python extra installs the ASF/Earthaccess clients for a local worker (`python3 -m pip install -e '.[ingest]'`). Raster-backed GNSS and DEM operations also need system GDAL Python bindings.
+
+Register a monitor with its GeoJSON footprint and provider settings in `config`, then queue its daily idempotent discovery pass:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/monitors \
+  -H "X-API-Key: $INSAR_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"monitor_name":"site-a","geometry":{"type":"Point","coordinates":[-99.13,19.43]},"config":{"sensor":"opera","burst_id":"T041_086877_IW1","lookback_days":45,"max_granules":6,"stack":true}}'
+insarctl sync-monitor site-a
+```
+
+The API stores the request and transactional outbox record in PostGIS; Celery dispatches it to the worker. Track progress at the returned `/v1/ingestions/{ingestion_id}` URL. `GET /v1/screen` data comes from PostGIS indexes, and result assets are served from MinIO with HTTP range support.
+
+To import a legacy API database, keep its SQLite file available locally and run `insarctl migrate-sqlite /path/to/oem_jobs.db` with `INSAR_DATABASE_URL` pointing at the Compose PostGIS database. The import skips rows already present in Postgres.
+
+API and worker containers keep only temporary working files. Put direct pair-job inputs in the configured S3/MinIO bucket and pass `s3://bucket/key` paths; the C++ worker reads those rasters through GDAL's S3 virtual filesystem. Ingestion workers stream provider inputs or download them into disposable scratch space, then publish pair and stack assets back to object storage.
+
+To use the C++ binding in a local build, install `python3 -m pip install -e '.[native]'` in the selected Python environment and configure CMake with `-DINSAR_BUILD_PYTHON=ON`; the Compose worker image builds and installs this binding automatically. The ndarray interface accepts contiguous CPU arrays through DLPack (including NumPy and CPU PyTorch tensors); CUDA arrays are not supported by this CPU engine.
 
 ```bash
 # Build C++ binaries (`insar_proto`, `insar_stack`) and run C++ + Python test suites
@@ -113,7 +193,22 @@ python3 scripts/validate_gnss.py \
 python3 scripts/plots/plot_raster_map.py \
   --stack-dir insar_work/stacks/mexico_city_iw1 \
   --layer velocity --focus-urban
+
+# 6. Export standalone interactive maps (raster and vector payloads are embedded in each HTML)
+python3 scripts/plots/export_interactive_map.py \
+  --site-name "Mexico City · Sentinel-1 C-band" \
+  --stack-dir insar_work/stacks/mexico_city_iw1 \
+  --corridors data/corridors/mexico_city_corridors.geojson \
+  --gnss-json data/validation/mexico_city_gnss_validation.json \
+  --output docs/interactive/mexico_city.html
+python3 scripts/plots/export_interactive_map.py \
+  --site-name "West Yorkshire · NISAR L-band" \
+  --stack-dir insar_work/stacks/west_yorkshire_t052 \
+  --corridors data/corridors/west_yorkshire_corridors.geojson \
+  --output docs/interactive/west_yorkshire.html
 ```
+
+The reports provide satellite/dark basemap selection, raster opacity, a velocity/coherence swipe, clickable corridor displacement histories, and GNSS station charts where validation data are available. The HTML embeds the raster and feature payloads; Leaflet, Chart.js, and basemap tiles load from public CDNs.
 
 ### Unified OEM HTTP API & Docker
 
@@ -121,12 +216,11 @@ python3 scripts/plots/plot_raster_map.py \
 # Run locally (serves both /v1/jobs via insar_proto and /v1/stacks/{stack_id}/updates via insar_stack)
 uvicorn api.server:app --host 0.0.0.0 --port 8000
 
-# Or build & run the multi-stage container (bundles insar_proto, insar_stack, API, and scripts)
-docker build -t insar-oem-api .
-docker run -p 8000:8000 -v $(pwd)/data:/data insar-oem-api
+# The API image is intended to run with the worker and durable services via Compose.
+docker compose up -d --build
 ```
 
-Key endpoints: `GET /health`, `POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /stac/items/{job_id}`, `POST /v1/stacks/{stack_id}/updates`, `GET /v1/stacks`, `GET /v1/stacks/{stack_id}`, `GET /stac/stacks/{stack_id}`, `GET /assets/{job_id}/{file}`, `GET /stack-assets/{stack_id}/{file}`.
+Key endpoints: `GET /health`, `GET /v1/admin/usage`, `POST /v1/monitors`, `POST /v1/monitors/{monitor_name}/sync`, `GET /v1/ingestions/{ingestion_id}`, `POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /preview/{job_id}`, `GET /stac/items/{job_id}`, `POST /v1/stacks/{stack_id}/updates`, `GET /v1/stacks`, `GET /v1/stacks/{stack_id}`, `GET /stac/stacks/{stack_id}`, `GET /assets/{job_id}/{file}`, and `GET /stack-assets/{stack_id}/{file}`. The `POST /v1/jobs` response includes a `preview_url` immediately, including while the job is queued.
 
 ---
 

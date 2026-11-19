@@ -11,6 +11,21 @@ namespace insar {
 class InterferogramEstimator {
 public:
     size_t compute(
+        const Complex* reference,
+        const Complex* secondary,
+        int in_width,
+        int in_height,
+        int out_width,
+        int out_height,
+        int stride_x,
+        int stride_y,
+        int look_rx,
+        int look_ry,
+        std::vector<float>& wrapped,
+        std::vector<float>& coherence,
+        std::vector<uint8_t>& valid_mask) const;
+
+    size_t compute(
         const SlcPair& pair,
         int out_w,
         int out_h,

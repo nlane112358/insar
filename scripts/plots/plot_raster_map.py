@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""
-Render a single standalone cartographic map for any derived InSAR stack GeoTIFF layer
-(velocity, cumulative displacement, temporal coherence, uncertainty, or acceleration)
-with coherence-modulated shading, crisp infrastructure corridor overlays, km scalebar,
-and dynamically proportioned layout.
+"""Render standalone cartographic maps for derived InSAR stack GeoTIFF layers.
+
+Velocity maps use DEM hillshade, confidence-weighted opacity, asymmetric scientific
+color clipping, crisp infrastructure corridor overlays, and a km scalebar.
 """
 
 from __future__ import annotations
@@ -123,20 +122,124 @@ def _compute_urban_focus_extent(
     return (xmin - pad_x, xmax + pad_x, ymin - pad_y, ymax + pad_y)
 
 
+def _recorded_dem_path(stack_dir: Path, ledger: dict[str, Any]) -> Path | None:
+    """Resolve the DEM path recorded by stack_timeseries, stripping its fingerprint."""
+    raw = (ledger.get("stack_params", {}) or {}).get("dem")
+    if not isinstance(raw, str) or not raw:
+        return None
+    path_part, separator, fingerprint = raw.rpartition(":")
+    if separator and len(fingerprint) >= 8 and all(ch in "0123456789abcdefABCDEF" for ch in fingerprint):
+        raw = path_part
+    candidate = Path(raw).expanduser()
+    if candidate.is_file():
+        return candidate
+    # Stack ledgers may have been copied from another checkout. Use the conventional
+    # site DEM beside insar_work/stacks when the recorded absolute path has gone stale.
+    for parent in (stack_dir.parent.parent, stack_dir.parent.parent.parent):
+        fallback = parent / "dem" / f"{stack_dir.name}_cop30.tif"
+        if fallback.is_file():
+            return fallback
+    return None
+
+
+def _load_dem_on_grid(dem_path: Path, target: Any) -> Any:
+    """Read a DEM aligned to the target raster, reprojecting in memory if needed."""
+    import numpy as np
+    from osgeo import gdal
+
+    gdal.UseExceptions()
+    src = gdal.Open(str(dem_path))
+    if src is None:
+        raise FileNotFoundError(f"Could not open DEM: {dem_path}")
+    src_band = src.GetRasterBand(1)
+    src_nodata = src_band.GetNoDataValue()
+    target_gt = tuple(target.geotransform)
+    source_gt = tuple(float(v) for v in src.GetGeoTransform())
+    source_wkt = src.GetProjection() or ""
+    h, w = target.data.shape
+    same_crs = source_wkt == target.projection_wkt or (not source_wkt and not target.projection_wkt)
+    same_grid = (
+        src.RasterXSize == w
+        and src.RasterYSize == h
+        and np.allclose(source_gt, target_gt, rtol=0.0, atol=1e-8)
+        and same_crs
+    )
+    if same_grid:
+        data = src_band.ReadAsArray().astype(np.float64)
+    else:
+        if not source_wkt or not target.projection_wkt:
+            src = None
+            raise ValueError(f"Cannot align DEM without source and target CRS: {dem_path}")
+        driver = gdal.GetDriverByName("MEM")
+        dst = driver.Create("", w, h, 1, gdal.GDT_Float32)
+        dst.SetGeoTransform(target_gt)
+        dst.SetProjection(target.projection_wkt)
+        dst_band = dst.GetRasterBand(1)
+        dst_band.SetNoDataValue(-9999.0)
+        dst_band.Fill(-9999.0)
+        gdal.ReprojectImage(src, dst, source_wkt, target.projection_wkt, gdal.GRA_Bilinear)
+        data = dst_band.ReadAsArray().astype(np.float64)
+        data[data == -9999.0] = np.nan
+        dst = None
+    if src_nodata is not None and np.isfinite(src_nodata):
+        data[data == src_nodata] = np.nan
+    data[~np.isfinite(data)] = np.nan
+    src = None
+    return data
+
+
+def _multidirectional_hillshade(dem: Any, geotransform: tuple[float, float, float, float, float, float]) -> Any:
+    """Build a softly normalized four-direction hillshade from a projected DEM."""
+    import numpy as np
+    from matplotlib.colors import LightSource
+
+    valid = np.isfinite(dem)
+    if not valid.any():
+        return None
+    filled = np.where(valid, dem, float(np.nanmedian(dem[valid])))
+    dx = max(1.0, math.hypot(geotransform[1], geotransform[4]))
+    dy = max(1.0, math.hypot(geotransform[2], geotransform[5]))
+    shades = [
+        LightSource(azdeg=azimuth, altdeg=42).hillshade(filled, vert_exag=1.0, dx=dx, dy=dy)
+        for azimuth in (0, 90, 180, 270)
+    ]
+    shade = np.mean(shades, axis=0)
+    lo, hi = np.nanpercentile(shade[valid], [3.0, 97.0])
+    if hi <= lo:
+        shade[:] = 0.5
+    else:
+        shade = np.clip((shade - lo) / (hi - lo), 0.0, 1.0)
+    shade[~valid] = np.nan
+    return shade
+
+
+def _shade_rgba_luminance(rgba: Any, hillshade: Any, strength: float) -> Any:
+    """Modulate velocity color luminance while preserving its diverging hue."""
+    import numpy as np
+    from matplotlib.colors import rgb_to_hsv, hsv_to_rgb
+
+    shaded = rgba.copy()
+    hsv = rgb_to_hsv(shaded[..., :3])
+    strength = float(np.clip(strength, 0.0, 1.0))
+    modulation = 1.0 + strength * (2.0 * np.nan_to_num(hillshade, nan=0.5) - 1.0)
+    hsv[..., 2] = np.clip(hsv[..., 2] * modulation, 0.0, 1.0)
+    shaded[..., :3] = hsv_to_rgb(hsv)
+    return shaded
+
+
 def _clip_rgba_with_coherence(
     data: Any,
     coh: Any | None,
+    uncertainty: Any | None,
     cmap: Any,
-    vmin: float,
-    vmax: float,
+    norm: Any,
     fade_low: float,
     fade_high: float,
     use_fade: bool,
+    uncertainty_scale: float | None,
 ) -> Any:
     import numpy as np
-    from matplotlib.colors import Normalize
 
-    norm = Normalize(vmin=vmin, vmax=vmax, clip=True)
     finite = np.isfinite(data)
     safe = np.where(finite, data, 0.0)
     rgba = cmap(norm(safe))
@@ -144,8 +247,15 @@ def _clip_rgba_with_coherence(
 
     if use_fade and coh is not None:
         c = np.where(np.isfinite(coh), coh, 0.0)
-        alpha = np.clip((c - fade_low) / max(fade_high - fade_low, 1e-4), 0.14, 1.0)
-        rgba[..., 3] = np.where(finite, alpha, 0.0)
+        ramp = np.clip((c - fade_low) / max(fade_high - fade_low, 1e-4), 0.0, 1.0)
+        alpha = 0.08 + 0.92 * ramp * ramp * (3.0 - 2.0 * ramp)
+        rgba[..., 3] *= np.where(finite, alpha, 0.0)
+
+    if uncertainty is not None and uncertainty_scale is not None and uncertainty_scale > 0.0:
+        unc_valid = np.isfinite(uncertainty) & (uncertainty >= 0.0)
+        scaled = np.where(unc_valid, uncertainty / uncertainty_scale, 0.0)
+        confidence = 1.0 / (1.0 + scaled * scaled)
+        rgba[..., 3] *= np.where(finite, confidence, 0.0)
     return rgba
 
 
@@ -187,12 +297,15 @@ def render_raster_map(
     label_top: int = 5,
     min_label_coh: float = 0.60,
     vlim: float | None = None,
+    dem_path: Path | None = None,
+    show_hillshade: bool = True,
+    hillshade_strength: float = 0.13,
     dpi: int = 220,
 ) -> Path:
     import numpy as np
     import matplotlib.patheffects as pe
     from matplotlib.cm import ScalarMappable
-    from matplotlib.colors import Normalize
+    from matplotlib.colors import Normalize, TwoSlopeNorm
     from matplotlib.lines import Line2D
     from matplotlib.ticker import FuncFormatter, MaxNLocator
 
@@ -207,6 +320,18 @@ def render_raster_map(
     coh_layer = load_raster(coh_path) if coh_path.is_file() else None
     summary = load_stack_summary(stack_dir)
     ledger = load_stack_ledger(stack_dir)
+
+    resolved_dem = dem_path or _recorded_dem_path(stack_dir, ledger)
+    hillshade = None
+    if layer == "velocity" and show_hillshade and hillshade_strength > 0.0 and resolved_dem is not None:
+        if not resolved_dem.is_file():
+            if dem_path is not None:
+                raise FileNotFoundError(f"DEM not found: {resolved_dem}")
+        else:
+            dem_data = _load_dem_on_grid(resolved_dem, rlayer)
+            hillshade = _multidirectional_hillshade(dem_data, rlayer.geotransform)
+            if hillshade is not None:
+                print(f"Using DEM hillshade -> {resolved_dem}")
 
     if focus_urban and coh_layer is not None:
         view_extent = _compute_urban_focus_extent(coh_layer.data, rlayer.geotransform, coh_threshold=focus_coh)
@@ -224,25 +349,35 @@ def render_raster_map(
     iy0, iy1 = max(0, min(iy_a, iy_b)), min(h, max(iy_a, iy_b))
     sub = rlayer.data[iy0:iy1, ix0:ix1]
     sub_coh = coh_layer.data[iy0:iy1, ix0:ix1] if coh_layer is not None else None
+    uncertainty_path = stack_dir / "velocity_uncertainty_mm_yr.tif"
+    uncertainty_layer = load_raster(uncertainty_path) if layer == "velocity" and uncertainty_path.is_file() else None
+    sub_uncertainty = uncertainty_layer.data[iy0:iy1, ix0:ix1] if uncertainty_layer is not None else None
 
     if spec["diverging"]:
-        cmap = make_diverging_cmap()
+        cmap = make_diverging_cmap().copy()
+        cmap.set_under(cmap(0.0))
+        cmap.set_over(cmap(1.0))
         if vlim is not None:
             lim = abs(float(vlim))
+            if lim <= 0.0:
+                raise ValueError("--vlim must be greater than zero")
+            vmin, vmax = -lim, lim
         else:
             mask = np.isfinite(sub)
             if sub_coh is not None and (mask & (sub_coh >= 0.50)).sum() > 200:
                 mask = mask & (sub_coh >= 0.50)
-            vals = np.abs(sub[mask])
-            lim = float(np.nanpercentile(vals, spec["percentile"])) if vals.size else spec["min_abs"]
-            lim = max(lim, spec["min_abs"])
-            # Snap cleanly to tidy tick bound
-            step = 50.0 if lim > 150 else (20.0 if lim > 50 else (10.0 if lim > 20 else 5.0))
-            lim = math.ceil(lim / step) * step
-        vmin, vmax = -lim, lim
+            vals = sub[mask]
+            if vals.size:
+                vmin, vmax = (float(v) for v in np.nanpercentile(vals, [2.5, 97.5]))
+            else:
+                vmin, vmax = -spec["min_abs"], spec["min_abs"]
+            vmin = min(vmin, -float(spec["min_abs"]))
+            vmax = max(vmax, float(spec["min_abs"]))
+        norm = TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
     elif layer == "coherence":
         cmap = make_coherence_cmap()
         vmin, vmax = 0.0, 1.0
+        norm = Normalize(vmin=vmin, vmax=vmax, clip=False)
     else:
         cmap = make_uncertainty_cmap()
         vals = sub[np.isfinite(sub)]
@@ -250,6 +385,17 @@ def render_raster_map(
             raise RuntimeError(f"No finite values in {raster_path} (uncertainty requires >= 2 stacked pairs).")
         vmax = float(vlim) if vlim is not None else max(5.0, float(np.nanpercentile(vals, spec["percentile"])))
         vmin = 0.0
+        norm = Normalize(vmin=vmin, vmax=vmax, clip=False)
+
+    uncertainty_scale = None
+    if sub_uncertainty is not None:
+        uncertainty_valid = np.isfinite(sub_uncertainty) & (sub_uncertainty >= 0.0)
+        if sub_coh is not None:
+            coherent_uncertainty = uncertainty_valid & np.isfinite(sub_coh) & (sub_coh >= fade_low)
+            if coherent_uncertainty.any():
+                uncertainty_valid = coherent_uncertainty
+        if uncertainty_valid.any():
+            uncertainty_scale = max(1.0, float(np.nanpercentile(sub_uncertainty[uncertainty_valid], 75.0)))
 
     # Dynamic balanced figure dimensions based on physical map aspect
     aspect = (xmax - xmin) / max(ymax - ymin, 1.0)
@@ -274,16 +420,32 @@ def render_raster_map(
     ax = fig.add_axes([left_m, bot_m, right_m - left_m, top_m - bot_m])
     ax.set_facecolor(NODATA_BG)
 
+    if hillshade is not None:
+        ax.imshow(
+            np.ma.masked_invalid(hillshade),
+            extent=rlayer.extent,
+            origin="upper",
+            cmap="Greys",
+            vmin=0.0,
+            vmax=1.0,
+            interpolation="bilinear",
+            alpha=0.25 * min(1.0, max(0.0, hillshade_strength) / 0.13),
+            zorder=1,
+        )
+
     rgba = _clip_rgba_with_coherence(
         rlayer.data,
         coh_layer.data if coh_layer is not None else None,
+        uncertainty_layer.data if uncertainty_layer is not None else None,
         cmap,
-        vmin,
-        vmax,
+        norm,
         fade_low=fade_low,
         fade_high=fade_high,
         use_fade=(coh_fade and spec["coh_fade"]),
+        uncertainty_scale=uncertainty_scale,
     )
+    if hillshade is not None:
+        rgba = _shade_rgba_luminance(rgba, hillshade, hillshade_strength)
     ax.imshow(rgba, extent=rlayer.extent, origin="upper", interpolation="nearest", zorder=2)
 
     # Overlay infrastructure corridors cleanly
@@ -425,10 +587,11 @@ def render_raster_map(
 
     # Compact corridor class legend inside top-left if corridors drawn
     if drawn_classes:
-        ordered_cls = sorted(drawn_classes, key=lambda c: list(LAYER_SPECS.keys()) if False else c)
+        priority = ["rail", "metro", "light_rail", "water_works", "reservoir", "dam", "canal", "river", "motorway", "trunk", "airport_runway", "infrastructure"]
+        ordered_cls = [c for c in priority if c in drawn_classes] + [c for c in sorted(drawn_classes) if c not in priority]
         handles = [
             Line2D([0], [0], color=asset_color(c), lw=2.0, label=asset_label(c))
-            for c in ordered_cls[:6]
+            for c in ordered_cls[:9]
         ]
         leg = ax.legend(
             handles=handles,
@@ -449,9 +612,10 @@ def render_raster_map(
     cax_y = 0.86 / fig_h
     cax_h = 0.17 / fig_h
     cax = fig.add_axes([left_m + 0.08, cax_y, (right_m - left_m) - 0.16, cax_h])
-    sm = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap=cmap)
+    sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
-    cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+    cb_extend = "both" if spec["diverging"] else ("max" if layer == "uncertainty" and np.any(rlayer.data > vmax) else "neither")
+    cb = fig.colorbar(sm, cax=cax, orientation="horizontal", extend=cb_extend)
     cb.outline.set_edgecolor("#B8C2CC")
     cb.outline.set_linewidth(0.75)
     cb.ax.tick_params(labelsize=8.5, length=3, color=MUTED, labelcolor=MUTED)
@@ -495,7 +659,12 @@ def render_raster_map(
         subtitle_gap=0.34 / fig_h,
     )
 
-    fade_note = f"Opacity faded below γ={fade_high:.2f} to suppress incoherent terrain" if (coh_fade and spec["coh_fade"]) else "Full-opacity raster display"
+    if coh_fade and spec["coh_fade"]:
+        fade_note = f"Smooth confidence opacity (γ {fade_low:.2f}–{fade_high:.2f} + velocity error)"
+    elif layer == "velocity" and uncertainty_scale is not None:
+        fade_note = "Opacity faded by velocity error"
+    else:
+        fade_note = "Full-opacity raster display"
     buf_m = summary.get("corridors", {}).get("buffer_m", 100.0)
     ramp_cfg = summary.get("ramp_removal", {})
     ramp_ord = ramp_cfg.get("order", 1)
@@ -505,6 +674,10 @@ def render_raster_map(
     if summary.get("reference_region", {}).get("applied"):
         extras.append("Ref pin: ON")
     extras.append(f"Corridor buffer: {buf_m:.0f} m")
+    if spec["diverging"]:
+        extras.append("Clip: manual" if vlim is not None else "Clip: p2.5–p97.5")
+    if layer == "velocity":
+        extras.append("DEM hillshade: ON" if hillshade is not None else "DEM hillshade: unavailable")
     extras.append(fade_note)
     footer_note = "  ·  ".join(extras)
     footer_fs = min(8.0, max(6.6, avail_w_in * 72.0 / max(len(footer_note) * 0.49, 1.0)))
@@ -535,7 +708,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-coh-fade", action="store_true", help="Disable coherence opacity fade")
     p.add_argument("--label-top", type=int, default=5, help="Number of top coherent corridors to label directly")
     p.add_argument("--min-label-coh", type=float, default=0.60, help="Minimum coherence to label a corridor")
-    p.add_argument("--vlim", type=float, default=None, help="Override symmetric color limit (or vmax for sequential layers)")
+    p.add_argument("--vlim", type=float, default=None, help="Override symmetric diverging limit (or vmax for sequential layers)")
+    p.add_argument("--dem", type=Path, default=None, help="DEM for velocity hillshade (defaults to the path recorded in stack_ledger.json)")
+    p.add_argument("--no-hillshade", action="store_true", help="Disable DEM relief under and within the velocity layer")
+    p.add_argument("--hillshade-strength", type=float, default=0.13, help="Velocity luminance modulation from 0 (off) to 1 (strong)")
     p.add_argument("--dpi", type=int, default=220)
     args = p.parse_args(argv)
 
@@ -553,6 +729,9 @@ def main(argv: list[str] | None = None) -> int:
         label_top=args.label_top,
         min_label_coh=args.min_label_coh,
         vlim=args.vlim,
+        dem_path=args.dem,
+        show_hillshade=not args.no_hillshade,
+        hillshade_strength=args.hillshade_strength,
         dpi=args.dpi,
     )
     return 0

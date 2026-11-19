@@ -1,3 +1,5 @@
+#include "insar/stack/stack_application.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2594,7 +2596,9 @@ void write_corridor_outputs(
 
 }  // namespace
 
-int main(int argc, char** argv) {
+namespace insar::stack {
+
+int run_cli(int argc, char** argv) {
     try {
         Options opt = parse_args(argc, argv);
         GDALAllRegister();
@@ -2776,3 +2780,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+
+int run_cli(const std::vector<std::string>& arguments) {
+    std::vector<std::string> storage;
+    storage.reserve(arguments.size() + 1);
+    storage.emplace_back("insar_stack");
+    storage.insert(storage.end(), arguments.begin(), arguments.end());
+
+    std::vector<char*> argv;
+    argv.reserve(storage.size());
+    for (auto& value : storage) {
+        argv.push_back(value.data());
+    }
+    return run_cli(static_cast<int>(argv.size()), argv.data());
+}
+
+}  // namespace insar::stack

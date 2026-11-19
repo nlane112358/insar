@@ -6,7 +6,7 @@ HOST       ?= 127.0.0.1
 PORT       ?= 8000
 
 .DEFAULT_GOAL := help
-.PHONY: all build test test-cpp test-py venv serve clean help
+.PHONY: all build test test-cpp test-py venv serve compose-up compose-down cli-install clean help
 
 all: build
 
@@ -28,6 +28,15 @@ venv: ## Create .venv and install Python dependencies
 
 serve: build ## Start the FastAPI OEM server
 	$(PYTHON) -m uvicorn api.server:app --host $(HOST) --port $(PORT)
+
+compose-up: ## Build and start PostGIS, MinIO, Redis, API, worker, and scheduler
+	docker compose up -d --build
+
+compose-down: ## Stop the local Compose stack and retain persisted volumes
+	docker compose down
+
+cli-install: ## Install the insarctl operator command in the active Python environment
+	$(PYTHON) -m pip install -e .
 
 clean: ## Remove build directory and Python caches
 	rm -rf $(BUILD_DIR)
