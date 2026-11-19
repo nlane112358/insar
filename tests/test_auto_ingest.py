@@ -337,15 +337,33 @@ class TestAutoIngestUnit(unittest.TestCase):
     def test_example_sites_config_loads(self) -> None:
         example_cfg = SCRIPTS_DIR / "sites.example.json"
         sites = ai.load_sites_config(example_cfg)
-        self.assertEqual([s.site_id for s in sites], ["mexico_city_iw2", "west_yorkshire_nisar"])
+        self.assertEqual([s.site_id for s in sites], ["mexico_city_iw1", "west_yorkshire_nisar"])
         self.assertEqual(sites[0].sensor, "opera")
         self.assertEqual(sites[1].sensor, "nisar")
         self.assertEqual(sites[1].bbox, (-1.85, 53.55, -1.70, 53.68))
+
+    def test_opera_hyphen_burst_id_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            f1 = _write_complex_h5(Path(td) / "o1.h5", "/data/VV")
+            prod = _FakeASFProduct(
+                scene_name="O1",
+                burst_id="T078_165486_IW2",
+                start_time="2026-11-14T00:47:14Z",
+                source_h5=f1,
+            )
+            fake_asf = _FakeASFModule([prod])
+            site = ai.SiteConfig(sensor="opera", burst_id="T078-165486-IW2")
+            resolved, cands = ai.fetch_opera_candidates(site, asf_mod=fake_asf)
+            self.assertEqual(resolved.burst_id, "T078_165486_IW2")
+            self.assertEqual(len(cands), 1)
+            self.assertEqual(fake_asf.search_calls[0]["operaBurstID"], "T078_165486_IW2")
 
     def test_nisar_track_filter_and_env_token_login(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             src_dir = td_path / "src"
+            raw_dir = td_path / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
             h_keep = _write_complex_h5(src_dir / "keep.h5", "/science/LSAR/GSLC/grids/frequencyA/HH", center_freq_hz=1.2575e9)
             h_drop = _write_complex_h5(src_dir / "drop.h5", "/science/LSAR/GSLC/grids/frequencyA/HH", center_freq_hz=1.2575e9)
             g_keep = _FakeEarthaccessGranule(
@@ -375,10 +393,13 @@ class TestAutoIngestUnit(unittest.TestCase):
             )
             with patch.dict(os.environ, {"EARTHDATA_TOKEN": "dummy_token"}):
                 _, cands = ai.fetch_nisar_candidates(site, ea_mod=fake_ea)
-
-            self.assertEqual(fake_ea.login_strategies, ["environment"])
-            self.assertEqual(len(cands), 1)
-            self.assertEqual(cands[0].stream_key, "NISAR_T045_F012_A")
+                # Public CMR search must not require auth until a download runs
+                self.assertEqual(fake_ea.login_strategies, [])
+                self.assertEqual(len(cands), 1)
+                self.assertEqual(cands[0].stream_key, "NISAR_T045_F012_A")
+                downloaded_path = cands[0].download_fn(raw_dir)
+                self.assertTrue(downloaded_path.is_file())
+                self.assertEqual(fake_ea.login_strategies, ["environment"])
 
 
 @unittest.skipUnless(ENGINE_BIN.is_file() and os.access(ENGINE_BIN, os.X_OK), "build/insar_proto not compiled")
@@ -394,15 +415,15 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             f3 = _write_complex_h5(src_dir / "OPERA_T078_20261025.h5", "/data/VV", phase_rad=0.9)
             f4 = _write_complex_h5(src_dir / "OPERA_T078_20261106.h5", "/data/VV", phase_rad=1.2)
 
-            p1 = _FakeASFProduct(scene_name="OPERA_G1", burst_id="T078-165486-IW2", start_time="2026-10-01T12:00:00Z", source_h5=f1)
-            p2 = _FakeASFProduct(scene_name="OPERA_G2", burst_id="T078-165486-IW2", start_time="2026-10-13T12:00:00Z", source_h5=f2)
-            p3 = _FakeASFProduct(scene_name="OPERA_G3", burst_id="T078-165486-IW2", start_time="2026-10-25T12:00:00Z", source_h5=f3)
-            p4 = _FakeASFProduct(scene_name="OPERA_G4", burst_id="T078-165486-IW2", start_time="2026-11-06T12:00:00Z", source_h5=f4)
+            p1 = _FakeASFProduct(scene_name="OPERA_G1", burst_id="T078_165486_IW2", start_time="2026-10-01T12:00:00Z", source_h5=f1)
+            p2 = _FakeASFProduct(scene_name="OPERA_G2", burst_id="T078_165486_IW2", start_time="2026-10-13T12:00:00Z", source_h5=f2)
+            p3 = _FakeASFProduct(scene_name="OPERA_G3", burst_id="T078_165486_IW2", start_time="2026-10-25T12:00:00Z", source_h5=f3)
+            p4 = _FakeASFProduct(scene_name="OPERA_G4", burst_id="T078_165486_IW2", start_time="2026-11-06T12:00:00Z", source_h5=f4)
 
             # Run 1: 3 granules -> 2 pairs -> prune first 2, keep 3rd
             fake_asf_1 = _FakeASFModule([p1, p3, p2])  # deliberately unsorted
             sum1 = ai.sync_and_process(
-                burst_id="T078-165486-IW2",
+                burst_id="T078_165486_IW2",
                 work_dir=work_dir,
                 engine_bin=ENGINE_BIN,
                 lookback_days=45,
@@ -416,8 +437,8 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             self.assertEqual(sum1.pairs_processed, 2)
             self.assertEqual(sum1.pruned_count, 2)
 
-            pair1_dir = work_dir / "products" / "T078-165486-IW2_2026-10-01_2026-10-13"
-            pair2_dir = work_dir / "products" / "T078-165486-IW2_2026-10-13_2026-10-25"
+            pair1_dir = work_dir / "products" / "T078_165486_IW2_2026-10-01_2026-10-13"
+            pair2_dir = work_dir / "products" / "T078_165486_IW2_2026-10-13_2026-10-25"
             for pdir in (pair1_dir, pair2_dir):
                 self.assertTrue((pdir / "wrapped_phase.tif").is_file())
                 self.assertTrue((pdir / "coherence.tif").is_file())
@@ -432,7 +453,7 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
 
             # Run 2: same 3 granules -> MUST NOT re-download pruned f1/f2 or rerun engine
             sum2 = ai.sync_and_process(
-                burst_id="T078-165486-IW2",
+                burst_id="T078_165486_IW2",
                 work_dir=work_dir,
                 engine_bin=ENGINE_BIN,
                 lookback_days=45,
@@ -450,7 +471,7 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             # Run 3: 4th pass arrives -> download only f4, pair f3 -> f4, prune f3
             fake_asf_2 = _FakeASFModule([p1, p2, p3, p4])
             sum3 = ai.sync_and_process(
-                burst_id="T078-165486-IW2",
+                burst_id="T078_165486_IW2",
                 work_dir=work_dir,
                 engine_bin=ENGINE_BIN,
                 lookback_days=45,
@@ -465,7 +486,7 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             self.assertEqual(sum3.pruned_count, 1)
             self.assertFalse((raw_dir / f3.name).exists())
             self.assertTrue((raw_dir / f4.name).exists())
-            self.assertTrue((work_dir / "products" / "T078-165486-IW2_2026-10-25_2026-11-06" / "displacement_mm.tif").is_file())
+            self.assertTrue((work_dir / "products" / "T078_165486_IW2_2026-10-25_2026-11-06" / "displacement_mm.tif").is_file())
 
     def test_nisar_end_to_end_streams_and_dynamic_wavelength(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -566,12 +587,12 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             f2 = _write_complex_h5(src_dir / "o2.h5", "/data/VV", phase_rad=0.4)
             fake_asf = _FakeASFModule(
                 [
-                    _FakeASFProduct(scene_name="O1", burst_id="T078-165486-IW2", start_time="2026-10-01T00:00:00Z", source_h5=f1),
-                    _FakeASFProduct(scene_name="O2", burst_id="T078-165486-IW2", start_time="2026-10-13T00:00:00Z", source_h5=f2),
+                    _FakeASFProduct(scene_name="O1", burst_id="T078_165486_IW2", start_time="2026-10-01T00:00:00Z", source_h5=f1),
+                    _FakeASFProduct(scene_name="O2", burst_id="T078_165486_IW2", start_time="2026-10-13T00:00:00Z", source_h5=f2),
                 ]
             )
 
-            # Dry run must not create raw/ or state.db
+            # Dry run must not create raw/ or state.db (also exercises hyphenated burst normalization)
             site = ai.SiteConfig(site_id="s1", sensor="opera", burst_id="T078-165486-IW2", stride_x=2, stride_y=2)
             dry_sum = ai.sync_site(site, work_dir, ENGINE_BIN, dry_run=True, asf_mod=fake_asf)
             self.assertEqual(dry_sum.discovered_count, 2)
@@ -619,8 +640,8 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             # Mismatched dimensions (48x48 vs 32x32) causes insar_proto to exit non-zero
             f1 = _write_complex_h5(src_dir / "bad_1.h5", "/data/VV", width=48, height=48)
             f2 = _write_complex_h5(src_dir / "bad_2.h5", "/data/VV", width=32, height=32)
-            p1 = _FakeASFProduct(scene_name="BAD_1", burst_id="T078-165486-IW2", start_time="2026-10-01T00:00:00Z", source_h5=f1)
-            p2 = _FakeASFProduct(scene_name="BAD_2", burst_id="T078-165486-IW2", start_time="2026-10-13T00:00:00Z", source_h5=f2)
+            p1 = _FakeASFProduct(scene_name="BAD_1", burst_id="T078_165486_IW2", start_time="2026-10-01T00:00:00Z", source_h5=f1)
+            p2 = _FakeASFProduct(scene_name="BAD_2", burst_id="T078_165486_IW2", start_time="2026-10-13T00:00:00Z", source_h5=f2)
             fake_asf = _FakeASFModule([p1, p2])
 
             with self.assertRaises(Exception):

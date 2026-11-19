@@ -8,9 +8,9 @@
   },
   "sites": [
     {
-      "site_id": "mexico_city_iw2",
+      "site_id": "mexico_city_iw1",
       "sensor": "opera",
-      "burst_id": "T078-165486-IW2",
+      "burst_id": "T041_086877_IW1",
       "subdataset": "/data/VV"
     },
     {

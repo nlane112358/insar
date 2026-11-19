@@ -37,6 +37,7 @@ NISAR_DEFAULT_SHORT_NAME = "NISAR_L2_GSLC_V1"
 NISAR_DEFAULT_WAVELENGTH_MM = 238.4
 
 _NISAR_UR_PATTERN = re.compile(r"_(?:GSLC|RSLC)_(\d{3})_(\d{3})_([AD])_(\d{3})_")
+_OPERA_BURST_HYPHEN_RE = re.compile(r"^T\d{3}-\d{6}-IW\d$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -373,13 +374,26 @@ def _atomic_asf_download(prod: Any, session: Any, raw_dir: Path, fname: str) -> 
     return dest_file
 
 
+def _normalize_opera_burst_id(burst_id: str | None) -> str | None:
+    """Convert filename-style hyphenated OPERA burst IDs to CMR underscore format."""
+    if burst_id is None:
+        return None
+    cleaned = burst_id.strip()
+    if _OPERA_BURST_HYPHEN_RE.fullmatch(cleaned):
+        normalized = cleaned.upper().replace("-", "_")
+        print(f"Normalized OPERA Burst ID '{cleaned}' -> '{normalized}' for ASF CMR query.")
+        return normalized
+    return cleaned
+
+
 def fetch_opera_candidates(
     site: SiteConfig,
     asf_mod: Any = None,
 ) -> tuple[SiteConfig, list[GranuleCandidate]]:
     """Query ASF for OPERA CSLC-S1 granules for a site."""
     asf = asf_mod or _import_asf()
-    burst_id = site.burst_id or discover_burst_id(
+    raw_burst_id = _normalize_opera_burst_id(site.burst_id)
+    burst_id = raw_burst_id or discover_burst_id(
         site.lon, site.lat, site.lookback_days, asf_mod=asf
     )
     resolved_site = SiteConfig(**{**site.__dict__, "burst_id": burst_id})
@@ -526,7 +540,12 @@ def fetch_nisar_candidates(
 ) -> tuple[SiteConfig, list[GranuleCandidate]]:
     """Query NASA CMR via earthaccess for NISAR L2 GSLC granules."""
     ea = ea_mod or _import_earthaccess()
-    _login_earthaccess(ea)
+    auth_state = {"authenticated": False}
+
+    def _ensure_authenticated() -> None:
+        if not auth_state["authenticated"]:
+            _login_earthaccess(ea)
+            auth_state["authenticated"] = True
 
     now = _utc_now()
     start_date = (now - timedelta(days=site.lookback_days)).strftime("%Y-%m-%d")
@@ -563,7 +582,10 @@ def fetch_nisar_candidates(
             continue
 
         def _make_downloader(g: Any = granule, fn: str = info["filename"]) -> Callable[[Path], Path]:
-            return lambda dest_dir: _atomic_earthaccess_download(ea, g, dest_dir, fn)
+            def _download(dest_dir: Path) -> Path:
+                _ensure_authenticated()
+                return _atomic_earthaccess_download(ea, g, dest_dir, fn)
+            return _download
 
         cand = GranuleCandidate(
             granule_id=info["granule_id"],
