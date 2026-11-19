@@ -99,7 +99,7 @@ python3 scripts/validate_gnss.py \
   --stack-dir insar_work/stacks/mexico_city_iw1 \
   --products-dir insar_work/products/mexico_city_iw1 \
   --dem insar_work/dem/mexico_city_iw1_cop30.tif \
-  --slc-h5 insar_work/raw/mexico_city_iw1/<opera_granule>.h5 \
+  --slc-h5 insar_work/raw/mexico_city_iw1 \
   --out-json data/validation/mexico_city_gnss_validation.json \
   --plot-out docs/figures/mexico_city_gnss_validation.png
 

@@ -497,8 +497,16 @@ def render_raster_map(
 
     fade_note = f"Opacity faded below γ={fade_high:.2f} to suppress incoherent terrain" if (coh_fade and spec["coh_fade"]) else "Full-opacity raster display"
     buf_m = summary.get("corridors", {}).get("buffer_m", 100.0)
-    ramp_ord = summary.get("ramp_removal", {}).get("order", 1)
-    footer_note = f"Ramp removal: order-{ramp_ord} robust Huber/Tukey IRLS  ·  Corridor buffer: {buf_m:.0f} m  ·  {fade_note}"
+    ramp_cfg = summary.get("ramp_removal", {})
+    ramp_ord = ramp_cfg.get("order", 1)
+    extras: list[str] = [f"Ramp: order-{ramp_ord} IRLS"]
+    if ramp_cfg.get("dem_applied"):
+        extras.append("DEM tropo: ON")
+    if summary.get("reference_region", {}).get("applied"):
+        extras.append("Ref pin: ON")
+    extras.append(f"Corridor buffer: {buf_m:.0f} m")
+    extras.append(fade_note)
+    footer_note = "  ·  ".join(extras)
     footer_fs = min(8.0, max(6.6, avail_w_in * 72.0 / max(len(footer_note) * 0.49, 1.0)))
     add_footer(
         fig,

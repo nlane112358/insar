@@ -1104,7 +1104,22 @@ def validate_stack_against_gnss(
         d_end_w = datetime.strptime(ledger["pair_ids"][-1].split("_")[1], "%Y-%m-%d").date()
         window_dates = (d_start_w, d_end_w)
 
-    orbit = load_orbit_from_opera_h5(slc_h5) if (slc_h5 is not None and slc_h5.is_file()) else None
+    resolved_slc_h5: Path | None = None
+    if slc_h5 is not None:
+        if slc_h5.is_file():
+            resolved_slc_h5 = slc_h5
+        elif slc_h5.is_dir():
+            cands = sorted(slc_h5.glob("*.h5"))
+            if cands:
+                resolved_slc_h5 = cands[-1]
+    else:
+        auto_raw_dir = stack_dir.parent.parent / "raw" / stack_dir.name
+        if auto_raw_dir.is_dir():
+            cands = sorted(auto_raw_dir.glob("*.h5"))
+            if cands:
+                resolved_slc_h5 = cands[-1]
+
+    orbit = load_orbit_from_opera_h5(resolved_slc_h5) if (resolved_slc_h5 is not None and resolved_slc_h5.is_file()) else None
     if gnss_csv is not None:
         stations = load_stations_from_csv(gnss_csv)
     else:
@@ -1315,7 +1330,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dem", type=Path, default=None, help="Optional aligned DEM GeoTIFF used during time-series overlay")
     p.add_argument("--gnss-cache-dir", type=Path, default=Path("insar_work/gnss/unr"), help="Directory with UNR DataHoldings.txt, midas.NA.txt, *.NA.tenv3")
     p.add_argument("--gnss-csv", type=Path, default=None, help="Optional local GNSS station CSV instead of UNR cache")
-    p.add_argument("--slc-h5", type=Path, default=None, help="OPERA CSLC-S1 .h5 file for exact zero-Doppler orbit LOS vector")
+    p.add_argument("--slc-h5", type=Path, default=None, help="OPERA CSLC-S1 .h5 file or raw directory containing .h5 granules for exact zero-Doppler orbit LOS vector")
     p.add_argument("--incidence-deg", type=float, default=34.0, help="Fallback radar incidence angle (deg) if --slc-h5 omitted")
     p.add_argument("--heading-deg", type=float, default=-169.0, help="Fallback satellite heading (deg CW from N) if --slc-h5 omitted")
     p.add_argument("--sample-radius-m", type=float, default=200.0, help="Spatial median radius around each GNSS station (m)")

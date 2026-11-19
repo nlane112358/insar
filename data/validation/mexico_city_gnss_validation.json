@@ -12,17 +12,7 @@
     "r2": 0.9446937672901616,
     "pearson_r": 0.973167292786775
   },
-  "baseline_metrics": {
-    "n_stations": 6,
-    "rmse_mm_yr": 63.9849137846321,
-    "mae_mm_yr": 42.45318265534741,
-    "bias_mm_yr": 37.82739567582986,
-    "median_bias_mm_yr": 19.91632472331311,
-    "rmse_debiased_mm_yr": 54.625669708270856,
-    "mae_debiased_mm_yr": 35.155717074663016,
-    "r2": 0.3214748796318294,
-    "pearson_r": 0.883018376403361
-  },
+  "baseline_metrics": null,
   "timeseries_overlay": {
     "station_id": "MMX1",
     "cumulative_rmse_mm": 7.72710219127485,
@@ -53,8 +43,8 @@
       "insar_coherence": 0.7378782629966736,
       "insar_sample_pixels": 139,
       "residual_mm_yr": 2.947416979724352,
-      "baseline_insar_los_mm_yr": 23.936174392700195,
-      "baseline_residual_mm_yr": 50.95834036534447
+      "baseline_insar_los_mm_yr": null,
+      "baseline_residual_mm_yr": null
     },
     {
       "station_id": "MMX1",
@@ -79,8 +69,8 @@
       "insar_coherence": 0.48735687136650085,
       "insar_sample_pixels": 123,
       "residual_mm_yr": 1.6637528582676566,
-      "baseline_insar_los_mm_yr": -70.32020568847656,
-      "baseline_residual_mm_yr": 144.6708176776036
+      "baseline_insar_los_mm_yr": null,
+      "baseline_residual_mm_yr": null
     },
     {
       "station_id": "MXAZ",
@@ -105,8 +95,8 @@
       "insar_coherence": 0.6530868709087372,
       "insar_sample_pixels": 140,
       "residual_mm_yr": 31.75313985490439,
-      "baseline_insar_los_mm_yr": -11.94442367553711,
-      "baseline_residual_mm_yr": -13.877360938552641
+      "baseline_insar_los_mm_yr": null,
+      "baseline_residual_mm_yr": null
     },
     {
       "station_id": "MXMX",
@@ -131,8 +121,8 @@
       "insar_coherence": 0.7333512902259827,
       "insar_sample_pixels": 139,
       "residual_mm_yr": -20.271624618715872,
-      "baseline_insar_los_mm_yr": 10.882976531982422,
-      "baseline_residual_mm_yr": 16.51246923809565
+      "baseline_insar_los_mm_yr": null,
+      "baseline_residual_mm_yr": null
     },
     {
       "station_id": "UNVA",
@@ -157,8 +147,8 @@
       "insar_coherence": 0.6915107369422913,
       "insar_sample_pixels": 131,
       "residual_mm_yr": -17.304115188226916,
-      "baseline_insar_los_mm_yr": -3.5248634815216064,
-      "baseline_residual_mm_yr": 5.37992750395753
+      "baseline_insar_los_mm_yr": null,
+      "baseline_residual_mm_yr": null
     },
     {
       "station_id": "UTAC",
@@ -183,8 +173,8 @@
       "insar_coherence": 0.6815323233604431,
       "insar_sample_pixels": 137,
       "residual_mm_yr": -16.49680015340791,
-      "baseline_insar_los_mm_yr": 22.6245174407959,
-      "baseline_residual_mm_yr": 23.320180208530566
+      "baseline_insar_los_mm_yr": null,
+      "baseline_residual_mm_yr": null
     }
   ]
 }

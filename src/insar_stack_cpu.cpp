@@ -2063,8 +2063,9 @@ std::string classify_corridor_risk(
     if (valid_pixels <= 0 || !std::isfinite(p95_abs_vel)) {
         return "no_coverage";
     }
+    const int min_crit_alerts = (valid_pixels >= 100) ? 3 : 1;
     const bool meets_critical =
-        alert_pixel_count > 0 &&
+        alert_pixel_count >= min_crit_alerts &&
         (p95_abs_vel >= 2.0 * vel_alert_mm_yr || alert_pixel_count >= 10 || std::abs(mean_vel) >= vel_alert_mm_yr);
     if (meets_critical) {
         if (stack_mature) {
