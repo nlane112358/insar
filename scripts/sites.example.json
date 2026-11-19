@@ -11,6 +11,9 @@
       "site_id": "mexico_city_iw1",
       "sensor": "opera",
       "burst_id": "T041_086877_IW1",
+      "stack": true,
+      "corridors": "data/corridors/mexico_city_corridors.geojson",
+      "buffer_m": 100.0,
       "subdataset": "/data/VV"
     },
     {
@@ -18,8 +21,11 @@
       "sensor": "nisar",
       "short_name": "NISAR_L2_GSLC_V1",
       "bbox": [-1.85, 53.55, -1.70, 53.68],
-      "track": 153,
+      "track": 52,
       "frame": 61,
+      "stack": true,
+      "corridors": "data/corridors/west_yorkshire_corridors.geojson",
+      "buffer_m": 100.0,
       "direction": "DESCENDING",
       "subdataset": "/science/LSAR/GSLC/grids/frequencyA/HH",
       "lookback_days": 60,

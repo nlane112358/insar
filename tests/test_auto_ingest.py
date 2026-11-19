@@ -342,7 +342,7 @@ class TestAutoIngestUnit(unittest.TestCase):
         self.assertEqual(sites[0].sensor, "opera")
         self.assertEqual(sites[1].sensor, "nisar")
         self.assertEqual(sites[1].bbox, (-1.85, 53.55, -1.70, 53.68))
-        self.assertEqual(sites[1].track, 153)
+        self.assertEqual(sites[1].track, 52)
         self.assertEqual(sites[1].frame, 61)
         self.assertTrue(sites[1].stream)
 

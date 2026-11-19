@@ -71,6 +71,13 @@ class SiteConfig:
     stream: bool = False
     stream_transport: str = "auto"
     work_dir: Path | None = None
+    stack: bool = False
+    stack_bin: Path = Path("./build/insar_stack")
+    corridors: Path | None = None
+    buffer_m: float = 100.0
+    ramp_order: int = 1
+    vel_alert_mm_yr: float = 15.0
+    accel_alert_mm_yr2: float = 25.0
 
     def resolved_subdataset(self) -> str:
         """Return explicit subdataset or the sensor-appropriate default."""
@@ -118,6 +125,8 @@ class SiteRunSummary:
     pairs_processed: int
     pairs_skipped: int
     pruned_count: int
+    stack_pairs: int = 0
+    stack_new_pairs: int = 0
 
 
 def _import_asf() -> Any:
@@ -1232,6 +1241,75 @@ def _resolve_pair_endpoint(
     return (target.gdal_uri, target, target)
 
 
+def _deduplicate_same_day_candidates(
+    candidates: Sequence[GranuleCandidate],
+) -> list[GranuleCandidate]:
+    """Keep the newest granule per (stream_key, acquisition_date) so reprocessed products never self-pair."""
+    latest_by_day: dict[tuple[str, str], GranuleCandidate] = {}
+    for cand in sorted(candidates, key=lambda c: (c.acq_time, c.granule_id)):
+        key = (cand.stream_key, cand.acq_time[:10])
+        latest_by_day[key] = cand
+    deduped = list(latest_by_day.values())
+    deduped.sort(key=lambda c: (c.acq_time, c.granule_id))
+    return deduped
+
+
+def _run_site_stack(
+    site: SiteConfig,
+    effective_work_dir: Path,
+    out_root: Path,
+    engine_bin: Path,
+    *,
+    dry_run: bool,
+) -> tuple[int, int]:
+    """Run O(1) incremental stacking on a site's processed product directory."""
+    stack_dir = (
+        effective_work_dir / "stacks" / site.site_id
+        if site.site_id
+        else effective_work_dir / "stacks"
+    )
+    if dry_run:
+        print(
+            f"[DRY-RUN] Would update sequential stack in {stack_dir} "
+            f"(ramp_order={site.ramp_order}, corridors={site.corridors}, buffer_m={site.buffer_m})"
+        )
+        return 0, 0
+
+    try:
+        from scripts.stack_timeseries import StackConfig, print_corridor_leaderboard, sync_stack
+    except ImportError:
+        from stack_timeseries import StackConfig, print_corridor_leaderboard, sync_stack
+
+    if not out_root.exists():
+        return 0, 0
+    has_pairs = any(
+        d.is_dir() and (d / "displacement_mm.tif").is_file() and (d / "coherence.tif").is_file()
+        for d in out_root.iterdir()
+    )
+    if not has_pairs:
+        return 0, 0
+
+    stack_bin = (
+        site.stack_bin
+        if site.stack_bin != Path("./build/insar_stack")
+        else (engine_bin.parent / "insar_stack")
+    )
+    cfg = StackConfig(
+        products_dir=out_root,
+        out_dir=stack_dir,
+        stack_bin=stack_bin,
+        ramp_order=site.ramp_order,
+        corridors=site.corridors,
+        buffer_m=site.buffer_m,
+        vel_alert_mm_yr=site.vel_alert_mm_yr,
+        accel_alert_mm_yr2=site.accel_alert_mm_yr2,
+    )
+    summary = sync_stack(cfg)
+    if site.corridors is not None:
+        print_corridor_leaderboard(stack_dir, top_n=8)
+    return summary.total_pairs_in_chain, summary.newly_stacked
+
+
 def sync_site(
     site: SiteConfig,
     work_dir: Path,
@@ -1266,7 +1344,7 @@ def sync_site(
     else:
         raise ValueError(f"Unsupported sensor '{site.sensor}'; expected 'opera' or 'nisar'")
 
-    candidates.sort(key=lambda c: (c.acq_time, c.granule_id))
+    candidates = _deduplicate_same_day_candidates(candidates)
     print(f"Found {len(candidates)} granules in window.")
 
     cand_by_id = {cand.granule_id: cand for cand in candidates}
@@ -1391,7 +1469,12 @@ def sync_site(
         # 3. Form consecutive pairs (t_k -> t_{k+1}) per stream and invoke C++ engine
         subdataset = resolved_site.resolved_subdataset()
         for stream_key, stream_rows in streams.items():
-            for ref_row, sec_row in zip(stream_rows, stream_rows[1:]):
+            # Deduplicate historical rows by acquisition date per stream
+            deduped_rows: dict[str, dict[str, Any]] = {}
+            for r in stream_rows:
+                deduped_rows[str(r["acq_time"])[:10]] = r
+            ordered_rows = [deduped_rows[d] for d in sorted(deduped_rows.keys())]
+            for ref_row, sec_row in zip(ordered_rows, ordered_rows[1:]):
                 ref_id = ref_row["granule_id"]
                 sec_id = sec_row["granule_id"]
                 ref_t = ref_row["acq_time"]
@@ -1537,6 +1620,17 @@ def sync_site(
     finally:
         conn.close()
 
+    stack_pairs = 0
+    stack_new_pairs = 0
+    if resolved_site.stack:
+        stack_pairs, stack_new_pairs = _run_site_stack(
+            resolved_site,
+            effective_work_dir,
+            out_root,
+            engine_bin,
+            dry_run=dry_run,
+        )
+
     return SiteRunSummary(
         site_id=resolved_site.site_id or (resolved_site.burst_id or resolved_site.sensor),
         sensor=resolved_site.sensor,
@@ -1545,6 +1639,8 @@ def sync_site(
         pairs_processed=pairs_processed,
         pairs_skipped=pairs_skipped,
         pruned_count=pruned_count,
+        stack_pairs=stack_pairs,
+        stack_new_pairs=stack_new_pairs,
     )
 
 
@@ -1623,6 +1719,8 @@ def _build_site_from_mapping(
         )
 
     work_dir_raw = merged.get("work_dir")
+    corridors_raw = merged.get("corridors")
+    stack_bin_raw = merged.get("stack_bin")
     return SiteConfig(
         site_id=site_id,
         sensor=sensor,
@@ -1654,6 +1752,13 @@ def _build_site_from_mapping(
         stream=bool(merged.get("stream", False)),
         stream_transport=stream_transport,
         work_dir=Path(work_dir_raw) if work_dir_raw else None,
+        stack=bool(merged.get("stack", False)),
+        stack_bin=Path(stack_bin_raw) if stack_bin_raw else Path("./build/insar_stack"),
+        corridors=Path(corridors_raw) if corridors_raw else None,
+        buffer_m=float(merged.get("buffer_m", 100.0)),
+        ramp_order=int(merged.get("ramp_order", 1)),
+        vel_alert_mm_yr=float(merged.get("vel_alert_mm_yr", 15.0)),
+        accel_alert_mm_yr2=float(merged.get("accel_alert_mm_yr2", 25.0)),
     )
 
 
@@ -1769,6 +1874,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Transport for --stream mode (auto picks /vsis3/ in us-west-2, /vsicurl/ elsewhere)",
     )
+    parser.add_argument("--stack", action="store_true", help="Run sequential multi-pass stacking & ramp removal after pairing")
+    parser.add_argument("--corridors", type=Path, help="Optional GeoJSON/GPKG infrastructure corridors to pin stack outputs")
+    parser.add_argument("--buffer-m", type=float, default=100.0, help="Corridor buffer distance in meters (default: 100.0)")
+    parser.add_argument("--ramp-order", type=int, default=1, choices=[-1, 0, 1, 2], help="Robust IRLS ramp removal order (default: 1)")
+    parser.add_argument("--vel-alert-mm-yr", type=float, default=15.0, help="Corridor |velocity| alert threshold (mm/yr)")
+    parser.add_argument("--accel-alert-mm-yr2", type=float, default=25.0, help="Corridor |acceleration| alert threshold (mm/yr^2)")
     parser.add_argument("--dry-run", action="store_true", help="Query catalog and print plan without executing")
     parser.add_argument(
         "--continue-on-error",
@@ -1796,6 +1907,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "prune_raw": args.prune_raw,
             "stream": args.stream,
             "stream_transport": args.stream_transport,
+            "stack": args.stack,
+            "corridors": str(args.corridors) if args.corridors else None,
+            "buffer_m": args.buffer_m,
+            "ramp_order": args.ramp_order,
+            "vel_alert_mm_yr": args.vel_alert_mm_yr,
+            "accel_alert_mm_yr2": args.accel_alert_mm_yr2,
         }
         sites = load_sites_config(args.sites_config, cli_defaults=cli_defaults)
     else:
@@ -1827,6 +1944,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 prune_raw=args.prune_raw,
                 stream=args.stream,
                 stream_transport=args.stream_transport,
+                stack=args.stack,
+                corridors=args.corridors,
+                buffer_m=args.buffer_m,
+                ramp_order=args.ramp_order,
+                vel_alert_mm_yr=args.vel_alert_mm_yr,
+                accel_alert_mm_yr2=args.accel_alert_mm_yr2,
             )
         ]
 
@@ -1840,10 +1963,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 engine_bin=args.engine,
                 dry_run=args.dry_run,
             )
+            stack_msg = (
+                f", stack_pairs={summary.stack_pairs} (+{summary.stack_new_pairs})"
+                if summary.stack_pairs > 0 or site.stack
+                else ""
+            )
             print(
                 f"[{summary.site_id}] done: discovered={summary.discovered_count}, "
                 f"downloaded={summary.downloaded_count}, pairs_processed={summary.pairs_processed}, "
-                f"pairs_skipped={summary.pairs_skipped}, pruned={summary.pruned_count}"
+                f"pairs_skipped={summary.pairs_skipped}, pruned={summary.pruned_count}{stack_msg}"
             )
         except Exception as exc:
             failures += 1

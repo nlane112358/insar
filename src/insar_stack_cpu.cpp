@@ -87,6 +87,7 @@ struct RasterMeta {
 };
 
 struct StackMetadata {
+    double origin_days = 0.0;
     double first_t0_days = 0.0;
     double last_t1_days = 0.0;
     double sum_dt_days = 0.0;
@@ -158,6 +159,7 @@ struct Options {
     double max_missing_frac = 0.6;
     bool export_ramp_disp = true;
     bool no_export = false;
+    bool skip_cog = false;
 };
 
 std::string json_escape(const std::string& input) {
@@ -210,7 +212,8 @@ void print_usage(const char* argv0) {
         << "  --vel-alert-mm-yr <float>     |Velocity| alert threshold in mm/yr (default 15.0)\n"
         << "  --accel-alert-mm-yr2 <float>  |Acceleration| alert threshold in mm/yr^2 (default 25.0)\n"
         << "  --min-alert-coh <float>       Minimum temporal coherence for alerts (default 0.55)\n"
-        << "  --no-export                   Update state raster only without exporting derived COGs\n"
+        << "  --no-export                   Update state raster only without exporting outputs\n"
+        << "  --skip-cog                    Export corridor JSONs/summary without encoding COGs\n"
         << "  --help                        Show this help text\n";
 }
 
@@ -250,13 +253,15 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--buffer-m") {
             opt.buffer_m = std::stod(need_val(i, "--buffer-m"));
         } else if (arg == "--vel-alert-mm-yr") {
-            opt.vel_alert_mm_yr = std::stof(need_val(i, "--vel_alert_mm_yr"));
+            opt.vel_alert_mm_yr = std::stof(need_val(i, "--vel-alert-mm-yr"));
         } else if (arg == "--accel-alert-mm-yr2") {
             opt.accel_alert_mm_yr2 = std::stof(need_val(i, "--accel-alert-mm-yr2"));
         } else if (arg == "--min-alert-coh") {
             opt.min_alert_coh = std::stof(need_val(i, "--min-alert-coh"));
         } else if (arg == "--no-export") {
             opt.no_export = true;
+        } else if (arg == "--skip-cog") {
+            opt.skip_cog = true;
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
@@ -418,6 +423,7 @@ void read_state_raster(
         const char* val = ds->GetMetadataItem(key);
         return (val != nullptr) ? std::stoi(val) : fallback;
     };
+    smeta.origin_days = read_meta_d("STACK_ORIGIN_DAYS", 0.0);
     smeta.first_t0_days = read_meta_d("STACK_FIRST_T0_DAYS", 0.0);
     smeta.last_t1_days = read_meta_d("STACK_LAST_T1_DAYS", 0.0);
     smeta.sum_dt_days = read_meta_d("STACK_SUM_DT_DAYS", 0.0);
@@ -472,6 +478,7 @@ void write_state_raster(
     if (!meta.wkt.empty()) {
         ds->SetProjection(meta.wkt.c_str());
     }
+    ds->SetMetadataItem("STACK_ORIGIN_DAYS", std::to_string(smeta.origin_days).c_str());
     ds->SetMetadataItem("STACK_FIRST_T0_DAYS", std::to_string(smeta.first_t0_days).c_str());
     ds->SetMetadataItem("STACK_LAST_T1_DAYS", std::to_string(smeta.last_t1_days).c_str());
     ds->SetMetadataItem("STACK_SUM_DT_DAYS", std::to_string(smeta.sum_dt_days).c_str());
@@ -597,15 +604,19 @@ RampResult remove_robust_ramp(
     const double inv_half_h = (height > 1) ? 2.0 / static_cast<double>(height - 1) : 0.0;
 
     std::vector<double> coeffs(n_params, 0.0);
-    double huber_delta = std::numeric_limits<double>::infinity();
+    double mad_sigma = 1.0;
     const size_t n_valid = valid_idx.size();
     const size_t sample_step = std::max<size_t>(1, n_valid / 200000);
     std::vector<double> abs_res_sample;
     abs_res_sample.reserve((n_valid + sample_step - 1) / sample_step);
 
-    for (int iter = 0; iter < 5; ++iter) {
+    // 2 convex Huber IRLS passes followed by 4 redescending Tukey Biweight passes
+    // so localized subsidence bowls do not bias the regional background ramp.
+    for (int iter = 0; iter < 6; ++iter) {
         std::vector<double> ata(static_cast<size_t>(n_params) * n_params, 0.0);
         std::vector<double> aty(n_params, 0.0);
+        const double huber_delta = 1.345 * mad_sigma;
+        const double tukey_c = 4.685 * mad_sigma;
 
         #pragma omp parallel
         {
@@ -626,8 +637,17 @@ RampResult remove_robust_ramp(
                 double val = static_cast<double>(disp[idx]);
                 if (iter > 0) {
                     double r = std::abs(val - eval_ramp_basis(order, u, v, coeffs));
-                    if (r > huber_delta) {
-                        w *= (huber_delta / r);
+                    if (iter <= 2) {
+                        if (r > huber_delta) {
+                            w *= (huber_delta / r);
+                        }
+                    } else {
+                        if (r >= tukey_c) {
+                            continue;
+                        }
+                        double t = r / tukey_c;
+                        double s = 1.0 - t * t;
+                        w *= s * s;
                     }
                 }
                 phi[0] = 1.0;
@@ -675,7 +695,7 @@ RampResult remove_robust_ramp(
         }
         coeffs = aty;
 
-        if (iter < 4) {
+        if (iter < 5) {
             abs_res_sample.clear();
             for (size_t k = 0; k < n_valid; k += sample_step) {
                 size_t idx = valid_idx[k];
@@ -688,8 +708,7 @@ RampResult remove_robust_ramp(
             }
             size_t mid = abs_res_sample.size() / 2;
             std::nth_element(abs_res_sample.begin(), abs_res_sample.begin() + mid, abs_res_sample.end());
-            double mad_sigma = std::max(0.5, 1.4826 * abs_res_sample[mid]);
-            huber_delta = 1.345 * mad_sigma;
+            mad_sigma = std::max(0.05, 1.4826 * abs_res_sample[mid]);
         }
     }
 
@@ -720,10 +739,11 @@ void update_state_incremental(
     const std::vector<float>& coh,
     double t0_days,
     double t1_days,
+    double origin_days,
     float min_coh
 ) {
     const double tau_yr = (t1_days - t0_days) / kDaysPerYear;
-    const double m_yr = 0.5 * (t0_days + t1_days) / kDaysPerYear;
+    const double m_yr = (0.5 * (t0_days + t1_days) - origin_days) / kDaysPerYear;
     const double x1 = tau_yr;
     const double x2 = m_yr * tau_yr;
     const double x11 = x1 * x1;
@@ -1061,7 +1081,7 @@ void process_corridors(
             }
             UniqueOgrGeom g_buf;
             if (buf_units > 0.0) {
-                g_buf.reset(g_dst->Buffer(buf_units, 8));
+                g_buf.reset(g_dst->Buffer(buf_units, 4));
             } else {
                 g_buf.reset(g_dst->clone());
             }
@@ -1107,8 +1127,10 @@ void process_corridors(
                 sub_ds->SetProjection(meta.wkt.c_str());
             }
             std::vector<uint8_t> mask(static_cast<size_t>(pw) * static_cast<size_t>(ph), 0);
-            sub_ds->GetRasterBand(1)->RasterIO(
-                GF_Write, 0, 0, pw, ph, mask.data(), pw, ph, GDT_Byte, 0, 0, nullptr);
+            if (sub_ds->GetRasterBand(1)->RasterIO(
+                    GF_Write, 0, 0, pw, ph, mask.data(), pw, ph, GDT_Byte, 0, 0, nullptr) != CE_None) {
+                throw std::runtime_error("Failed initializing corridor mask buffer");
+            }
 
             OGRGeometryH geoms[1] = { OGRGeometry::ToHandle(g_buf.get()) };
             int bands[1] = {1};
@@ -1122,8 +1144,10 @@ void process_corridors(
             if (r_err != CE_None) {
                 throw std::runtime_error("GDALRasterizeGeometries failed for corridor " + cm.name);
             }
-            sub_ds->GetRasterBand(1)->RasterIO(
-                GF_Read, 0, 0, pw, ph, mask.data(), pw, ph, GDT_Byte, 0, 0, nullptr);
+            if (sub_ds->GetRasterBand(1)->RasterIO(
+                    GF_Read, 0, 0, pw, ph, mask.data(), pw, ph, GDT_Byte, 0, 0, nullptr) != CE_None) {
+                throw std::runtime_error("Failed reading corridor mask buffer");
+            }
 
             const int corridor_idx = static_cast<int>(metrics_out.size());
             std::vector<double> abs_vels;
@@ -1410,14 +1434,16 @@ int main(int argc, char** argv) {
                 ? opt.t0_days
                 : (have_existing ? smeta.last_t1_days : 0.0);
             double t1 = std::isfinite(opt.t1_days) ? opt.t1_days : (t0 + opt.dt_days);
+            if (smeta.pair_count == 0) {
+                smeta.origin_days = t0;
+                smeta.first_t0_days = t0;
+            }
 
             ramp = remove_robust_ramp(
                 meta.width, meta.height, ramp_disp, coh, opt.ramp_order, opt.min_coh);
-            update_state_incremental(state_bands, npix, ramp_disp, coh, t0, t1, opt.min_coh);
+            update_state_incremental(
+                state_bands, npix, ramp_disp, coh, t0, t1, smeta.origin_days, opt.min_coh);
 
-            if (smeta.pair_count == 0) {
-                smeta.first_t0_days = t0;
-            }
             smeta.last_t1_days = t1;
             smeta.sum_dt_days += (t1 - t0);
             smeta.pair_count += 1;
@@ -1433,13 +1459,15 @@ int main(int argc, char** argv) {
             fs::create_directories(out_dir);
 
             DerivedFields df = derive_products(state_bands, npix, smeta, opt.min_coh);
-            write_cog_f32(out_dir / "velocity_mm_yr.tif", meta, df.vel, "LOS Velocity (mm/yr)");
-            write_cog_f32(out_dir / "acceleration_mm_yr2.tif", meta, df.accel, "LOS Acceleration (mm/yr^2)");
-            write_cog_f32(out_dir / "cumulative_disp_mm.tif", meta, df.cum_disp, "Cumulative LOS Displacement (mm)");
-            write_cog_f32(out_dir / "temporal_coherence.tif", meta, df.temp_coh, "Mean Temporal Coherence");
-            write_cog_f32(out_dir / "velocity_uncertainty_mm_yr.tif", meta, df.unc, "Velocity Std Error (mm/yr)");
-            if (opt.export_ramp_disp && !ramp_disp.empty()) {
-                write_cog_f32(out_dir / "ramp_removed_disp_mm.tif", meta, ramp_disp, "Latest Pair Ramp-Removed Displacement (mm)");
+            if (!opt.skip_cog) {
+                write_cog_f32(out_dir / "velocity_mm_yr.tif", meta, df.vel, "LOS Velocity (mm/yr)");
+                write_cog_f32(out_dir / "acceleration_mm_yr2.tif", meta, df.accel, "LOS Acceleration (mm/yr^2)");
+                write_cog_f32(out_dir / "cumulative_disp_mm.tif", meta, df.cum_disp, "Cumulative LOS Displacement (mm)");
+                write_cog_f32(out_dir / "temporal_coherence.tif", meta, df.temp_coh, "Mean Temporal Coherence");
+                write_cog_f32(out_dir / "velocity_uncertainty_mm_yr.tif", meta, df.unc, "Velocity Std Error (mm/yr)");
+                if (opt.export_ramp_disp && !ramp_disp.empty()) {
+                    write_cog_f32(out_dir / "ramp_removed_disp_mm.tif", meta, ramp_disp, "Latest Pair Ramp-Removed Displacement (mm)");
+                }
             }
 
             std::vector<CorridorMetric> metrics;

@@ -81,6 +81,9 @@ endif()
 add_executable(insar_proto src/main.cpp)
 target_link_libraries(insar_proto PRIVATE insar_core)
 
+add_executable(insar_stack src/insar_stack_cpu.cpp)
+target_link_libraries(insar_stack PRIVATE insar_core)
+
 if(INSAR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/test_insar_engine.cpp")
     enable_testing()
     add_executable(insar_cpp_tests tests/cpp/test_insar_engine.cpp)
