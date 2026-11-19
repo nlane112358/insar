@@ -4,6 +4,9 @@
     "max_granules": 6,
     "stride_x": 6,
     "stride_y": 3,
+    "max_skip": 1,
+    "min_alert_snr": 2.5,
+    "min_alert_span_days": 60.0,
     "prune_raw": true
   },
   "sites": [
@@ -12,6 +15,9 @@
       "sensor": "opera",
       "burst_id": "T041_086877_IW1",
       "stack": true,
+      "ref_lonlat": [-99.235, 19.535],
+      "ref_radius_m": 1500.0,
+      "two_pass_deform_mask": true,
       "corridors": "data/corridors/mexico_city_corridors.geojson",
       "buffer_m": 100.0,
       "subdataset": "/data/VV"

@@ -12,8 +12,6 @@ struct CliOptions {
     std::string slc2_path;
     std::string subdataset = "/data/VV";
     std::string out_dir = "out";
-    int synth_width = 900;
-    int synth_height = 700;
     int stride_x = -1;
     int stride_y = -1;
     int look_rx = 3;
@@ -23,8 +21,8 @@ struct CliOptions {
     float wavelength_mm = 55.4658f;
     float alert_threshold_mm = 25.0f;
     float min_alert_coh = 0.65f;
+    ReferenceRegionConfig reference_region;
 
-    bool is_synthetic() const noexcept;
     int resolved_stride_x() const noexcept;
     int resolved_stride_y() const noexcept;
     ProcessingConfig to_processing_config() const noexcept;

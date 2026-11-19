@@ -54,7 +54,13 @@ GeoCoordinateTransformer::GeoCoordinateTransformer(const GeoMetadata& meta)
             src_srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
             dst_srs.SetWellKnownGeogCS("WGS84");
             dst_srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+            is_projected_ = src_srs.IsProjected() != 0;
+            if (is_projected_) {
+                const double lin = src_srs.GetLinearUnits(nullptr);
+                linear_units_m_ = (lin > 0.0) ? lin : 1.0;
+            }
             ct_.reset(OGRCreateCoordinateTransformation(&src_srs, &dst_srs));
+            inv_ct_.reset(OGRCreateCoordinateTransformation(&dst_srs, &src_srs));
         }
     }
 }
@@ -74,6 +80,43 @@ bool GeoCoordinateTransformer::pixel_to_lonlat(
     lon = x;
     lat = y;
     return std::isfinite(lon) && std::isfinite(lat);
+}
+
+bool GeoCoordinateTransformer::lonlat_to_pixel(
+    double lon, double lat, double& px, double& py) const
+{
+    if (!inv_ct_) {
+        return false;
+    }
+    double mx = lon;
+    double my = lat;
+    if (!inv_ct_->Transform(1, &mx, &my)) {
+        return false;
+    }
+    const auto& gt = meta_.geotransform;
+    const double det = gt[1] * gt[5] - gt[2] * gt[4];
+    if (std::abs(det) < 1e-18) {
+        return false;
+    }
+    const double dx = mx - gt[0];
+    const double dy = my - gt[3];
+    px = (gt[5] * dx - gt[2] * dy) / det;
+    py = (-gt[4] * dx + gt[1] * dy) / det;
+    return std::isfinite(px) && std::isfinite(py);
+}
+
+double GeoCoordinateTransformer::meters_to_pixels(double radius_m, double lat_deg) const {
+    const auto& gt = meta_.geotransform;
+    const double pix_x = std::hypot(gt[1], gt[4]);
+    const double pix_y = std::hypot(gt[2], gt[5]);
+    const double pix_units = std::max(1e-12, 0.5 * (pix_x + pix_y));
+    if (is_projected_) {
+        const double crs_units = radius_m / linear_units_m_;
+        return crs_units / pix_units;
+    }
+    const double cos_lat = std::max(0.2, std::cos(lat_deg * 3.14159265358979323846 / 180.0));
+    const double deg_units = radius_m / (111320.0 * cos_lat);
+    return deg_units / pix_units;
 }
 
 Wgs84BBox GeoCoordinateTransformer::compute_wgs84_bbox() const {

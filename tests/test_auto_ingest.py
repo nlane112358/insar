@@ -906,6 +906,61 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             self.assertEqual(summary_json["width"], 32)
             self.assertEqual(summary_json["height"], 32)
 
+    def test_max_skip_generates_skip1_skip2_pairs_and_safe_prune(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            src_dir = td_path / "src"
+            work_dir = td_path / "work_skip"
+
+            dates = ["2026-10-01", "2026-10-07", "2026-10-13", "2026-10-19"]
+            products = []
+            for idx, d in enumerate(dates):
+                h5 = _write_complex_h5(src_dir / f"OPERA_T041_{d}.h5", "/data/VV", phase_rad=0.2 * idx)
+                products.append(
+                    _FakeASFProduct(
+                        scene_name=f"OPERA_T041_{d}",
+                        burst_id="T041_086877_IW1",
+                        start_time=f"{d}T12:00:00Z",
+                        source_h5=h5,
+                    )
+                )
+
+            site = ai.SiteConfig(
+                site_id="skip_test",
+                sensor="opera",
+                burst_id="T041_086877_IW1",
+                stride_x=2,
+                stride_y=2,
+                max_skip=2,
+                prune_raw=True,
+            )
+            summary = ai.sync_site(site, work_dir, ENGINE_BIN, asf_mod=_FakeASFModule(products))
+            # 4 epochs with max_skip=2 => 3 consecutive + 2 skip-1 + 1 skip-2 = 6 pairs
+            self.assertEqual(summary.pairs_processed, 6)
+            # Only the 1st granule has all forward pairs (skip-0, skip-1, skip-2) satisfied and may be pruned
+            self.assertEqual(summary.pruned_count, 1)
+
+            prod_dirs = sorted(p.name for p in (work_dir / "products" / "skip_test").iterdir() if p.is_dir())
+            expected = sorted([
+                "T041_086877_IW1_2026-10-01_2026-10-07",
+                "T041_086877_IW1_2026-10-07_2026-10-13",
+                "T041_086877_IW1_2026-10-13_2026-10-19",
+                "T041_086877_IW1_2026-10-01_2026-10-13",
+                "T041_086877_IW1_2026-10-07_2026-10-19",
+                "T041_086877_IW1_2026-10-01_2026-10-19",
+            ])
+            self.assertEqual(prod_dirs, expected)
+
+            remaining_raw = sorted(p.name for p in (work_dir / "raw" / "skip_test").iterdir() if p.is_file())
+            self.assertEqual(
+                remaining_raw,
+                [
+                    "OPERA_T041_2026-10-07.h5",
+                    "OPERA_T041_2026-10-13.h5",
+                    "OPERA_T041_2026-10-19.h5",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

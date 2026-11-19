@@ -65,8 +65,12 @@ InsarProducts CpuInsarEngine::process(const SlcPair& pair, const ProcessingConfi
         products.unwrapped_phase,
         products.coherence,
         products.valid_mask,
+        products.metadata,
         config.wavelength_mm,
-        config.min_ref_coherence);
+        config.min_ref_coherence,
+        config.reference_region,
+        &products.stats.ref_pixels_used,
+        &products.stats.ref_region_pinned);
 
     return products;
 }

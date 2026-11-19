@@ -312,6 +312,29 @@ class StackTimeseriesTest(unittest.TestCase):
             }
             corridors_path.write_text(json.dumps(corridors_fc), encoding="utf-8")
 
+            summary_immature = sync_stack(
+                StackConfig(
+                    products_dir=prod_dir,
+                    out_dir=out_dir,
+                    stack_bin=STACK_BIN,
+                    corridors=corridors_path,
+                    buffer_m=60.0,
+                    vel_alert_mm_yr=25.0,
+                    min_alert_coh=0.6,
+                    min_alert_snr=2.5,
+                    min_alert_span_days=60.0,
+                )
+            )
+            # 24-day span is below the 60-day maturity threshold: critical alerts must be gated!
+            self.assertEqual(summary_immature.corridors_evaluated, 3)
+            self.assertEqual(summary_immature.critical_corridors, 0)
+            self.assertFalse(summary_immature.stack_mature)
+            rep_imm = json.loads((out_dir / "corridor_report.geojson").read_text(encoding="utf-8"))
+            by_id_imm = {f["properties"]["asset_id"]: f["properties"] for f in rep_imm["features"]}
+            self.assertEqual(by_id_imm["rail_active"]["risk_level"], "warning")
+            self.assertTrue(by_id_imm["rail_active"]["maturity_gated"])
+
+            # Now test with maturity threshold met (e.g. re-exporting with 20-day threshold for this 24-day fixture)
             summary = sync_stack(
                 StackConfig(
                     products_dir=prod_dir,
@@ -321,9 +344,12 @@ class StackTimeseriesTest(unittest.TestCase):
                     buffer_m=60.0,
                     vel_alert_mm_yr=25.0,
                     min_alert_coh=0.6,
+                    min_alert_snr=2.5,
+                    min_alert_span_days=20.0,
                 )
             )
             self.assertEqual(summary.corridors_evaluated, 3)
+            self.assertTrue(summary.stack_mature)
             self.assertGreaterEqual(summary.critical_corridors, 1)
             self.assertGreater(summary.corridor_alerts, 0)
 
@@ -411,6 +437,208 @@ class StackTimeseriesTest(unittest.TestCase):
             )
             self.assertEqual(summary.discovered_count, 2)
             self.assertEqual(summary.stack_pairs, 0)
+
+    def test_snr_gating_suppresses_noisy_corridor_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            prod_dir = tmp_p / "products"
+            out_dir = tmp_p / "stack_snr"
+
+            yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH]
+            steady_band = (yy >= 20) & (yy <= 34) & (xx >= 20) & (xx <= 90)
+            noisy_band = (yy >= 64) & (yy <= 78) & (xx >= 20) & (xx <= 90)
+
+            # 6 pairs * 12 days = 72 days (>= 60 days mature!)
+            dates = [
+                ("2026-07-01", "2026-07-13"),
+                ("2026-07-13", "2026-07-25"),
+                ("2026-07-25", "2026-08-06"),
+                ("2026-08-06", "2026-08-18"),
+                ("2026-08-18", "2026-08-30"),
+                ("2026-08-30", "2026-09-11"),
+            ]
+            # Alternating +/- atmospheric jitter giving mean ~-25 mm/yr but sigma_v ~140 mm/yr (SNR << 2.5)
+            jitter = [-8.0, +6.5, -9.0, +7.0, -8.5, +7.0]
+            for idx, (d0, d1) in enumerate(dates):
+                disp = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+                disp[steady_band] = -120.0 * (12.0 / 365.25)
+                disp[noisy_band] = jitter[idx]
+                coh = np.full((HEIGHT, WIDTH), 0.88, dtype=np.float32)
+                self._make_pair(prod_dir, "T041_086877_IW1", d0, d1, disp, coh)
+
+            corridors_path = tmp_p / "corridors.geojson"
+            corridors_fc = {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"asset_id": "steady_rail", "name": "Steady High-SNR Rail", "asset_class": "rail"},
+                        "geometry": {"type": "LineString", "coordinates": [_utm_to_wgs84(25, 27), _utm_to_wgs84(85, 27)]},
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {"asset_id": "noisy_road", "name": "Noisy Low-SNR Road", "asset_class": "motorway"},
+                        "geometry": {"type": "LineString", "coordinates": [_utm_to_wgs84(25, 71), _utm_to_wgs84(85, 71)]},
+                    },
+                ],
+            }
+            corridors_path.write_text(json.dumps(corridors_fc), encoding="utf-8")
+
+            summary = sync_stack(
+                StackConfig(
+                    products_dir=prod_dir,
+                    out_dir=out_dir,
+                    stack_bin=STACK_BIN,
+                    ramp_order=0,
+                    ref_px=(10, 10, 4),
+                    corridors=corridors_path,
+                    buffer_m=60.0,
+                    vel_alert_mm_yr=20.0,
+                    min_alert_coh=0.6,
+                    min_alert_snr=2.5,
+                    min_alert_span_days=60.0,
+                )
+            )
+            self.assertTrue(summary.stack_mature)
+            report = json.loads((out_dir / "corridor_report.geojson").read_text(encoding="utf-8"))
+            by_id = {f["properties"]["asset_id"]: f["properties"] for f in report["features"]}
+            self.assertEqual(by_id["steady_rail"]["risk_level"], "critical")
+            self.assertGreater(by_id["steady_rail"]["alert_pixel_count"], 10)
+            self.assertEqual(by_id["noisy_road"]["alert_pixel_count"], 0)
+            self.assertGreater(by_id["noisy_road"]["snr_gated_pixels"], 0)
+            self.assertNotEqual(by_id["noisy_road"]["risk_level"], "critical")
+
+    def test_ref_pin_deform_mask_dem_tropo_and_disconnected_island(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            prod_dir = tmp_p / "products"
+            out_dir = tmp_p / "stack_dem"
+
+            yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH]
+            # Create synthetic DEM: mountains on west (x < 35, up to 3500 m), foothills (35..70, 2300..2800 m),
+            # flat subsiding basin on east (x >= 70, 2230 m)
+            dem = 2230.0 + np.clip(70.0 - xx, 0.0, None) * 18.0 + 4.0 * np.abs(yy - 50.0)
+            dem_path = tmp_p / "synth_dem.tif"
+            _write_geotiff_f32(dem_path, dem)
+
+            # Decorrelation barrier splitting west mountain island (x < 24) from main basin (x >= 32)
+            barrier = (xx >= 24) & (xx < 32)
+            west_island = xx < 24
+            # Large eastern subsidence bowl (~35% of main basin)
+            bowl = (xx >= 74) & (yy >= 15) & (yy < 85)
+            # Explicit vector/raster exclusion mask for deformation bowl
+            deform_mask_path = tmp_p / "deform_mask.tif"
+            _write_geotiff_f32(deform_mask_path, bowl.astype(np.float32))
+
+            dates = [
+                ("2026-07-01", "2026-07-13"),
+                ("2026-07-13", "2026-07-25"),
+                ("2026-07-25", "2026-08-06"),
+                ("2026-08-06", "2026-08-18"),
+            ]
+            true_v_bowl = -180.0
+            dem_slopes = [24.0, -30.0, 18.0, -22.0]  # strong stratified troposphere (mm/km)
+            island_jumps = [55.46, -83.19, 27.73, -55.46]  # integer 2pi jumps on disconnected west island
+            for idx, (d0, d1) in enumerate(dates):
+                tau_yr = 12.0 / 365.25
+                disp = np.full((HEIGHT, WIDTH), 15.0, dtype=np.float64)  # arbitrary datum offset
+                disp += dem_slopes[idx] * ((dem - 2400.0) / 1000.0)
+                disp[bowl] += true_v_bowl * tau_yr
+                disp[west_island] += island_jumps[idx]
+
+                coh = np.full((HEIGHT, WIDTH), 0.85, dtype=np.float32)
+                coh[barrier] = 0.15
+                self._make_pair(prod_dir, "T041_086877_IW1", d0, d1, disp, coh)
+
+            # Pin to stable foothills bedrock at (48, 50)
+            sync_stack(
+                StackConfig(
+                    products_dir=prod_dir,
+                    out_dir=out_dir,
+                    stack_bin=STACK_BIN,
+                    ramp_order=0,
+                    dem=dem_path,
+                    ref_px=(48, 50, 5),
+                    deform_mask=deform_mask_path,
+                )
+            )
+            vel = _read_cog_f32(out_dir / "velocity_mm_yr.tif")
+            summary = json.loads((out_dir / "stack_summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["ramp_removal"]["dem_applied"])
+            self.assertTrue(summary["reference_region"]["applied"])
+            self.assertAlmostEqual(summary["ramp_removal"]["dem_slope_mm_per_km"], dem_slopes[-1], delta=2.0)
+
+            # Bedrock near reference & higher foothills must stay ~0 mm/yr despite +-30 mm/km tropo and west island jump
+            stable_foothills = (xx >= 38) & (xx <= 66) & (yy >= 20) & (yy <= 80)
+            self.assertAlmostEqual(float(np.nanmedian(vel[stable_foothills])), 0.0, delta=3.0)
+            # Subsidence bowl recovered accurately
+            self.assertAlmostEqual(float(np.nanmedian(vel[bowl])), true_v_bowl, delta=5.0)
+
+    def test_triplet_phase_closure_masks_local_jump_and_rejects_corrupted_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            prod_dir = tmp_p / "products"
+            out_dir = tmp_p / "stack_closure"
+
+            yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH]
+            subs_zone = (yy >= 30) & (yy < 70) & (xx >= 40) & (xx < 80)
+            true_v = -150.0  # mm/yr
+
+            # 5 epochs separated by 12 days: E0..E4
+            epochs = ["2026-07-01", "2026-07-13", "2026-07-25", "2026-08-06", "2026-08-18"]
+            coh = np.full((HEIGHT, WIDTH), 0.90, dtype=np.float32)
+
+            def _clean_disp(step_cnt: int) -> np.ndarray:
+                d = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+                d[subs_zone] = true_v * ((12.0 * step_cnt) / 365.25)
+                return d
+
+            # Consecutive pairs (0,1), (1,2), (2,3), (3,4)
+            self._make_pair(prod_dir, "T041_086877_IW1", epochs[0], epochs[1], _clean_disp(1), coh)
+            # Inject localized +27.73 mm (2*pi) unwrapping jump inside subs_zone on pair (1,2)
+            d12 = _clean_disp(1)
+            local_err = (yy >= 40) & (yy < 56) & (xx >= 50) & (xx < 66)
+            d12[local_err] += 27.73
+            self._make_pair(prod_dir, "T041_086877_IW1", epochs[1], epochs[2], d12, coh)
+
+            # Inject catastrophic +55.46 mm (4*pi) unwrapping failure across 60% of pair (2,3)
+            d23 = _clean_disp(1)
+            d23[:60, :] += 55.46
+            self._make_pair(prod_dir, "T041_086877_IW1", epochs[2], epochs[3], d23, coh)
+            self._make_pair(prod_dir, "T041_086877_IW1", epochs[3], epochs[4], _clean_disp(1), coh)
+
+            # Redundant skip-1 pairs (0,2), (1,3), (2,4) and skip-2 pairs (0,3), (1,4) — all clean!
+            for i in range(3):
+                self._make_pair(prod_dir, "T041_086877_IW1", epochs[i], epochs[i + 2], _clean_disp(2), coh)
+            for i in range(2):
+                self._make_pair(prod_dir, "T041_086877_IW1", epochs[i], epochs[i + 3], _clean_disp(3), coh)
+
+            summary = sync_stack(
+                StackConfig(
+                    products_dir=prod_dir,
+                    out_dir=out_dir,
+                    stack_bin=STACK_BIN,
+                    ramp_order=0,
+                    ref_px=(10, 10, 4),
+                    enable_closure=True,
+                    closure_thresh_mm=10.0,
+                    closure_max_bad_frac=0.35,
+                    closure_mode="consensus",
+                    include_redundant=True,
+                )
+            )
+            self.assertEqual(summary.total_pairs_in_chain, 4)
+            self.assertEqual(summary.redundant_pairs_found, 5)
+            self.assertEqual(summary.rejected_pairs, 1)  # Catastrophic pair (2,3) rejected!
+            self.assertGreater(summary.triplets_evaluated, 6)
+
+            ledger = json.loads((out_dir / "stack_ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["rejected_pair_ids"], ["2026-07-25_2026-08-06"])
+
+            vel = _read_cog_f32(out_dir / "velocity_mm_yr.tif")
+            # Both the locally unwrapping-corrupted patch AND the full subsidence zone must match true_v!
+            self.assertAlmostEqual(float(np.nanmedian(vel[local_err])), true_v, delta=3.0)
+            self.assertAlmostEqual(float(np.nanmedian(vel[subs_zone])), true_v, delta=3.0)
 
 
 if __name__ == "__main__":

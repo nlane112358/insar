@@ -16,12 +16,16 @@ public:
         float wavelength_mm,
         float min_ref_coherence);
 
-    static double compute_coherent_rmse_mm(
+    static std::vector<float> to_displacement_mm(
         const std::vector<float>& unwrapped_phase,
+        const std::vector<float>& coherence,
         const std::vector<uint8_t>& valid_mask,
-        const SyntheticTruth& truth,
+        const GeoMetadata& metadata,
         float wavelength_mm,
-        float min_true_coherence = 0.5f);
+        float min_ref_coherence,
+        const ReferenceRegionConfig& ref_config,
+        size_t* ref_pixels_out = nullptr,
+        bool* ref_pinned_out = nullptr);
 };
 
 } // namespace insar

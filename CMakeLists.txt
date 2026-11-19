@@ -31,7 +31,6 @@ add_library(insar_core STATIC
     src/engine/cpu_insar_engine.cpp
     src/io/gdal_utils.cpp
     src/io/gdal_slc_source.cpp
-    src/io/synthetic_slc_source.cpp
     src/io/cog_writer.cpp
     src/io/product_exporter.cpp
     src/analytics/anomaly_detector.cpp

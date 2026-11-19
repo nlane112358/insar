@@ -103,9 +103,15 @@ struct SlcPair {
     void validate() const;
 };
 
-struct SyntheticTruth {
-    std::vector<float> phase_rad;
-    std::vector<float> coherence;
+struct ReferenceRegionConfig {
+    bool enabled = false;
+    bool is_lonlat = false;
+    double lon = 0.0;
+    double lat = 0.0;
+    double radius_m = 1000.0;
+    int px = 0;
+    int py = 0;
+    int radius_px = 10;
 };
 
 struct ProcessingConfig {
@@ -118,6 +124,7 @@ struct ProcessingConfig {
     float min_edge_weight = 1e-5f;
     float wavelength_mm = 55.4658f;
     float min_ref_coherence = 0.65f;
+    ReferenceRegionConfig reference_region;
 };
 
 struct ProcessingStats {
@@ -126,6 +133,8 @@ struct ProcessingStats {
     int iterations = 0;
     double rel_residual = 0.0;
     size_t valid_pixels = 0;
+    size_t ref_pixels_used = 0;
+    bool ref_region_pinned = false;
 };
 
 struct InsarProducts {

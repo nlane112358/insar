@@ -6,22 +6,12 @@
 
 namespace insar::app {
 
-bool CliOptions::is_synthetic() const noexcept {
-    return slc1_path.empty() || slc2_path.empty();
-}
-
 int CliOptions::resolved_stride_x() const noexcept {
-    if (stride_x > 0) {
-        return stride_x;
-    }
-    return is_synthetic() ? 1 : 6; // OPERA 5m -> 30m
+    return (stride_x > 0) ? stride_x : 6; // OPERA 5m -> 30m
 }
 
 int CliOptions::resolved_stride_y() const noexcept {
-    if (stride_y > 0) {
-        return stride_y;
-    }
-    return is_synthetic() ? 1 : 3; // OPERA 10m -> 30m
+    return (stride_y > 0) ? stride_y : 3; // OPERA 10m -> 30m
 }
 
 ProcessingConfig CliOptions::to_processing_config() const noexcept {
@@ -32,6 +22,7 @@ ProcessingConfig CliOptions::to_processing_config() const noexcept {
     cfg.look_ry = look_ry;
     cfg.max_iters = max_iters;
     cfg.wavelength_mm = wavelength_mm;
+    cfg.reference_region = reference_region;
     return cfg;
 }
 
@@ -73,12 +64,6 @@ CliOptions CliParser::parse(int argc, char** argv) {
         } else if (arg == "--look-ry") {
             require_args(i, 1, arg);
             opts.look_ry = std::stoi(argv[++i]);
-        } else if (arg == "--width") {
-            require_args(i, 1, arg);
-            opts.synth_width = std::stoi(argv[++i]);
-        } else if (arg == "--height") {
-            require_args(i, 1, arg);
-            opts.synth_height = std::stoi(argv[++i]);
         } else if (arg == "--iters") {
             require_args(i, 1, arg);
             opts.max_iters = std::stoi(argv[++i]);
@@ -97,13 +82,29 @@ CliOptions CliParser::parse(int argc, char** argv) {
             opts.window.y = std::stoi(argv[++i]);
             opts.window.width = std::stoi(argv[++i]);
             opts.window.height = std::stoi(argv[++i]);
+        } else if (arg == "--ref-lonlat") {
+            require_args(i, 2, arg);
+            opts.reference_region.enabled = true;
+            opts.reference_region.is_lonlat = true;
+            opts.reference_region.lon = std::stod(argv[++i]);
+            opts.reference_region.lat = std::stod(argv[++i]);
+        } else if (arg == "--ref-radius-m") {
+            require_args(i, 1, arg);
+            opts.reference_region.radius_m = std::stod(argv[++i]);
+        } else if (arg == "--ref-px") {
+            require_args(i, 3, arg);
+            opts.reference_region.enabled = true;
+            opts.reference_region.is_lonlat = false;
+            opts.reference_region.px = std::stoi(argv[++i]);
+            opts.reference_region.py = std::stoi(argv[++i]);
+            opts.reference_region.radius_px = std::stoi(argv[++i]);
         } else {
             throw std::invalid_argument("Unknown option: " + arg);
         }
     }
 
-    if (opts.synth_width <= 0 || opts.synth_height <= 0) {
-        throw std::invalid_argument("--width and --height must be positive");
+    if (opts.slc1_path.empty() || opts.slc2_path.empty()) {
+        throw std::invalid_argument("Both --slc1 and --slc2 are required");
     }
     if (opts.look_rx < 0 || opts.look_ry < 0) {
         throw std::invalid_argument("--look-rx and --look-ry must be non-negative");
@@ -114,27 +115,36 @@ CliOptions CliParser::parse(int argc, char** argv) {
     if (opts.wavelength_mm <= 0.0f) {
         throw std::invalid_argument("--wavelength-mm must be positive");
     }
+    if (opts.reference_region.enabled) {
+        if (opts.reference_region.is_lonlat && opts.reference_region.radius_m <= 0.0) {
+            throw std::invalid_argument("--ref-radius-m must be positive");
+        }
+        if (!opts.reference_region.is_lonlat && opts.reference_region.radius_px <= 0) {
+            throw std::invalid_argument("--ref-px radius must be positive");
+        }
+    }
 
     return opts;
 }
 
 void CliParser::print_usage(const char* program_name) {
     std::printf(
-        "Usage: %s [options]\n"
-        "  --slc1 <path>         Reference OPERA CSLC-S1 .h5 or complex GeoTIFF\n"
-        "  --slc2 <path>         Secondary OPERA CSLC-S1 .h5 or complex GeoTIFF\n"
+        "Usage: %s --slc1 <path> --slc2 <path> [options]\n"
+        "  --slc1 <path>         Reference OPERA CSLC-S1 .h5, NISAR GSLC, or complex GeoTIFF (required)\n"
+        "  --slc2 <path>         Secondary OPERA CSLC-S1 .h5, NISAR GSLC, or complex GeoTIFF (required)\n"
         "  --subdataset <path>   HDF5 dataset path (default: /data/VV)\n"
-        "  --stride-x <int>      Horizontal multilook stride (default: 6 for OPERA, 1 for synthetic)\n"
-        "  --stride-y <int>      Vertical multilook stride (default: 3 for OPERA, 1 for synthetic)\n"
+        "  --stride-x <int>      Horizontal multilook stride (default: 6)\n"
+        "  --stride-y <int>      Vertical multilook stride (default: 3)\n"
         "  --look-rx <int>       Coherence half-window in X (default: 3)\n"
         "  --look-ry <int>       Coherence half-window in Y (default: 3)\n"
         "  --window x y w h      Optional pixel crop window on input raster\n"
-        "  --width <int>         Synthetic width when --slc1/--slc2 omitted (default: 900)\n"
-        "  --height <int>        Synthetic height when --slc1/--slc2 omitted (default: 700)\n"
         "  --iters <int>         Max PCG iterations (default: 40)\n"
         "  --wavelength-mm <f>   Radar wavelength in mm (default: 55.4658 for Sentinel-1 C-band)\n"
         "  --alert-mm <f>        Displacement alert threshold in mm (default: 25.0)\n"
         "  --alert-coh <f>       Minimum coherence for alerts/stats (default: 0.65)\n"
+        "  --ref-lonlat lon lat  Pin zero displacement to stable WGS84 reference region\n"
+        "  --ref-radius-m <f>    Reference region radius in meters (default: 1000.0)\n"
+        "  --ref-px x y r        Pin zero displacement to pixel disk (x, y, radius_px)\n"
         "  --out-dir <dir>       Output directory for COGs & JSON (default: ./out)\n",
         program_name);
 }

@@ -78,6 +78,19 @@ class SiteConfig:
     ramp_order: int = 1
     vel_alert_mm_yr: float = 15.0
     accel_alert_mm_yr2: float = 25.0
+    min_alert_snr: float = 2.5
+    min_alert_span_days: float = 60.0
+    dem: Path | None = None
+    ref_lonlat: tuple[float, float] | None = None
+    ref_radius_m: float = 1000.0
+    ref_region: Path | None = None
+    deform_mask: Path | None = None
+    two_pass_deform_mask: bool = False
+    max_skip: int = 0
+    closure_thresh_mm: float = 10.0
+    closure_max_bad_frac: float = 0.35
+    closure_mode: str = "consensus"
+    include_redundant: bool = True
 
     def resolved_subdataset(self) -> str:
         """Return explicit subdataset or the sensor-appropriate default."""
@@ -1187,6 +1200,14 @@ def build_engine_command(
         cmd.extend(["--alert-mm", str(site.alert_mm)])
     if site.alert_coh is not None:
         cmd.extend(["--alert-coh", str(site.alert_coh)])
+    if site.ref_lonlat is not None:
+        cmd.extend([
+            "--ref-lonlat",
+            f"{site.ref_lonlat[0]:.8f}",
+            f"{site.ref_lonlat[1]:.8f}",
+            "--ref-radius-m",
+            f"{site.ref_radius_m:.2f}",
+        ])
     return cmd
 
 
@@ -1299,10 +1320,22 @@ def _run_site_stack(
         out_dir=stack_dir,
         stack_bin=stack_bin,
         ramp_order=site.ramp_order,
+        dem=site.dem,
+        ref_lonlat=site.ref_lonlat,
+        ref_radius_m=site.ref_radius_m,
+        ref_region=site.ref_region,
+        deform_mask=site.deform_mask,
+        two_pass_deform_mask=site.two_pass_deform_mask,
+        closure_thresh_mm=site.closure_thresh_mm,
+        closure_max_bad_frac=site.closure_max_bad_frac,
+        closure_mode=site.closure_mode,
+        include_redundant=site.include_redundant,
         corridors=site.corridors,
         buffer_m=site.buffer_m,
         vel_alert_mm_yr=site.vel_alert_mm_yr,
         accel_alert_mm_yr2=site.accel_alert_mm_yr2,
+        min_alert_snr=site.min_alert_snr,
+        min_alert_span_days=site.min_alert_span_days,
     )
     summary = sync_stack(cfg)
     if site.corridors is not None:
@@ -1466,15 +1499,22 @@ def sync_site(
             for stream_rows in streams.values():
                 stream_rows.sort(key=lambda r: (r["acq_time"], r["granule_id"]))
 
-        # 3. Form consecutive pairs (t_k -> t_{k+1}) per stream and invoke C++ engine
+        # 3. Form consecutive pairs (t_k -> t_{k+1}) plus optional redundant skip-1 / skip-2 pairs per stream
         subdataset = resolved_site.resolved_subdataset()
+        max_step = max(1, 1 + max(0, int(resolved_site.max_skip)))
         for stream_key, stream_rows in streams.items():
             # Deduplicate historical rows by acquisition date per stream
             deduped_rows: dict[str, dict[str, Any]] = {}
             for r in stream_rows:
                 deduped_rows[str(r["acq_time"])[:10]] = r
             ordered_rows = [deduped_rows[d] for d in sorted(deduped_rows.keys())]
-            for ref_row, sec_row in zip(ordered_rows, ordered_rows[1:]):
+
+            pair_schedule: list[tuple[dict[str, Any], dict[str, Any], int]] = []
+            for step in range(1, max_step + 1):
+                for idx in range(len(ordered_rows) - step):
+                    pair_schedule.append((ordered_rows[idx], ordered_rows[idx + step], step - 1))
+
+            for ref_row, sec_row, _skip_level in pair_schedule:
                 ref_id = ref_row["granule_id"]
                 sec_id = sec_row["granule_id"]
                 ref_t = ref_row["acq_time"]
@@ -1590,21 +1630,32 @@ def sync_site(
                 )
                 conn.commit()
 
-            # 4. Optional disk hygiene: keep latest raw .h5 per stream, prune only forward-paired local files
-            if resolved_site.prune_raw and not dry_run and len(stream_rows) > 1:
-                for old_row in stream_rows[:-1]:
+            # 4. Optional disk hygiene: keep newest (max_skip + 1) raw .h5 per stream, prune only fully forward-paired local files
+            keep_tail = max_step
+            if resolved_site.prune_raw and not dry_run and len(ordered_rows) > keep_tail:
+                for idx, old_row in enumerate(ordered_rows[:-keep_tail]):
                     old_id = old_row["granule_id"]
                     old_local = str(old_row["local_path"])
                     if old_local.startswith("stream://"):
                         continue
-                    paired_forward = conn.execute(
-                        """
-                        SELECT 1 FROM processed_pairs
-                        WHERE site_id = ? AND ref_id = ?
-                        """,
-                        (resolved_site.site_id, old_id),
-                    ).fetchone()
-                    if not paired_forward:
+                    expected_secs = [
+                        ordered_rows[idx + step]["granule_id"]
+                        for step in range(1, max_step + 1)
+                        if idx + step < len(ordered_rows)
+                    ]
+                    all_paired = True
+                    for expected_sec_id in expected_secs:
+                        paired_forward = conn.execute(
+                            """
+                            SELECT 1 FROM processed_pairs
+                            WHERE site_id = ? AND ref_id = ? AND sec_id = ?
+                            """,
+                            (resolved_site.site_id, old_id, expected_sec_id),
+                        ).fetchone()
+                        if not paired_forward:
+                            all_paired = False
+                            break
+                    if not all_paired:
                         continue
 
                     p = Path(old_local)
@@ -1696,6 +1747,17 @@ def _parse_window(raw: Any) -> tuple[int, int, int, int] | None:
     return (x, y, w, h)
 
 
+def _parse_ref_lonlat(raw: Any) -> tuple[float, float] | None:
+    if raw is None:
+        return None
+    if len(raw) != 2:
+        raise ValueError(f"ref_lonlat must have 2 numbers [lon, lat], got {raw}")
+    lon, lat = float(raw[0]), float(raw[1])
+    if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+        raise ValueError(f"Invalid ref_lonlat coordinates {raw}")
+    return (lon, lat)
+
+
 def _build_site_from_mapping(
     entry: Mapping[str, Any],
     defaults: Mapping[str, Any],
@@ -1718,9 +1780,20 @@ def _build_site_from_mapping(
             "expected 'auto', 'https', or 's3'"
         )
 
+    max_skip = int(merged.get("max_skip", 0))
+    if max_skip < 0 or max_skip > 2:
+        raise ValueError(f"Site '{site_id}': max_skip must be 0, 1, or 2 (got {max_skip})")
+
+    closure_mode = str(merged.get("closure_mode", "consensus")).strip().lower()
+    if closure_mode not in {"consensus", "strict"}:
+        raise ValueError(f"Site '{site_id}': closure_mode must be 'consensus' or 'strict'")
+
     work_dir_raw = merged.get("work_dir")
     corridors_raw = merged.get("corridors")
     stack_bin_raw = merged.get("stack_bin")
+    dem_raw = merged.get("dem")
+    ref_region_raw = merged.get("ref_region")
+    deform_mask_raw = merged.get("deform_mask")
     return SiteConfig(
         site_id=site_id,
         sensor=sensor,
@@ -1759,6 +1832,19 @@ def _build_site_from_mapping(
         ramp_order=int(merged.get("ramp_order", 1)),
         vel_alert_mm_yr=float(merged.get("vel_alert_mm_yr", 15.0)),
         accel_alert_mm_yr2=float(merged.get("accel_alert_mm_yr2", 25.0)),
+        min_alert_snr=float(merged.get("min_alert_snr", 2.5)),
+        min_alert_span_days=float(merged.get("min_alert_span_days", 60.0)),
+        dem=Path(dem_raw) if dem_raw else None,
+        ref_lonlat=_parse_ref_lonlat(merged.get("ref_lonlat")),
+        ref_radius_m=float(merged.get("ref_radius_m", 1000.0)),
+        ref_region=Path(ref_region_raw) if ref_region_raw else None,
+        deform_mask=Path(deform_mask_raw) if deform_mask_raw else None,
+        two_pass_deform_mask=bool(merged.get("two_pass_deform_mask", False)),
+        max_skip=max_skip,
+        closure_thresh_mm=float(merged.get("closure_thresh_mm", 10.0)),
+        closure_max_bad_frac=float(merged.get("closure_max_bad_frac", 0.35)),
+        closure_mode=closure_mode,
+        include_redundant=bool(merged.get("include_redundant", True)),
     )
 
 
@@ -1875,11 +1961,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Transport for --stream mode (auto picks /vsis3/ in us-west-2, /vsicurl/ elsewhere)",
     )
     parser.add_argument("--stack", action="store_true", help="Run sequential multi-pass stacking & ramp removal after pairing")
+    parser.add_argument("--max-skip", type=int, default=0, choices=[0, 1, 2], help="Generate redundant skip-1 (1) and skip-2 (2) pairs for triplet phase closure (default: 0)")
+    parser.add_argument("--dem", type=Path, help="DEM GeoTIFF (local/SRTM/Copernicus) for elevation-correlated tropospheric correction")
+    parser.add_argument("--ref-lonlat", type=float, nargs=2, metavar=("LON", "LAT"), help="Pin zero displacement to known stable WGS84 reference region")
+    parser.add_argument("--ref-radius-m", type=float, default=1000.0, help="Radius (m) around --ref-lonlat (default: 1000.0)")
+    parser.add_argument("--ref-region", type=Path, help="Vector/raster polygon mask of stable reference bedrock")
+    parser.add_argument("--deform-mask", type=Path, help="Vector/raster exclusion mask for high-deformation zones before ramp fit")
+    parser.add_argument("--two-pass-deform-mask", action="store_true", help="Two-pass stack build to mask deforming areas before ramp fit from pass 0")
+    parser.add_argument("--closure-thresh-mm", type=float, default=10.0, help="Triplet closure threshold (mm) to mask unwrapping errors")
+    parser.add_argument("--closure-max-bad-frac", type=float, default=0.35, help="Reject pair if closure failure fraction exceeds this")
+    parser.add_argument("--closure-mode", choices=["consensus", "strict"], default="consensus", help="Multi-triplet masking mode")
     parser.add_argument("--corridors", type=Path, help="Optional GeoJSON/GPKG infrastructure corridors to pin stack outputs")
     parser.add_argument("--buffer-m", type=float, default=100.0, help="Corridor buffer distance in meters (default: 100.0)")
     parser.add_argument("--ramp-order", type=int, default=1, choices=[-1, 0, 1, 2], help="Robust IRLS ramp removal order (default: 1)")
     parser.add_argument("--vel-alert-mm-yr", type=float, default=15.0, help="Corridor |velocity| alert threshold (mm/yr)")
     parser.add_argument("--accel-alert-mm-yr2", type=float, default=25.0, help="Corridor |acceleration| alert threshold (mm/yr^2)")
+    parser.add_argument("--min-alert-snr", type=float, default=2.5, help="Minimum velocity SNR |v|/sigma_v for alerts (default: 2.5)")
+    parser.add_argument("--min-alert-span-days", type=float, default=60.0, help="Minimum stack span in days before critical velocity alerts (default: 60.0)")
     parser.add_argument("--dry-run", action="store_true", help="Query catalog and print plan without executing")
     parser.add_argument(
         "--continue-on-error",
@@ -1908,11 +2006,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "stream": args.stream,
             "stream_transport": args.stream_transport,
             "stack": args.stack,
+            "max_skip": args.max_skip,
+            "dem": str(args.dem) if args.dem else None,
+            "ref_lonlat": list(args.ref_lonlat) if args.ref_lonlat else None,
+            "ref_radius_m": args.ref_radius_m,
+            "ref_region": str(args.ref_region) if args.ref_region else None,
+            "deform_mask": str(args.deform_mask) if args.deform_mask else None,
+            "two_pass_deform_mask": args.two_pass_deform_mask,
+            "closure_thresh_mm": args.closure_thresh_mm,
+            "closure_max_bad_frac": args.closure_max_bad_frac,
+            "closure_mode": args.closure_mode,
             "corridors": str(args.corridors) if args.corridors else None,
             "buffer_m": args.buffer_m,
             "ramp_order": args.ramp_order,
             "vel_alert_mm_yr": args.vel_alert_mm_yr,
             "accel_alert_mm_yr2": args.accel_alert_mm_yr2,
+            "min_alert_snr": args.min_alert_snr,
+            "min_alert_span_days": args.min_alert_span_days,
         }
         sites = load_sites_config(args.sites_config, cli_defaults=cli_defaults)
     else:
@@ -1945,11 +2055,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stream=args.stream,
                 stream_transport=args.stream_transport,
                 stack=args.stack,
+                max_skip=args.max_skip,
+                dem=args.dem,
+                ref_lonlat=_parse_ref_lonlat(args.ref_lonlat),
+                ref_radius_m=args.ref_radius_m,
+                ref_region=args.ref_region,
+                deform_mask=args.deform_mask,
+                two_pass_deform_mask=args.two_pass_deform_mask,
+                closure_thresh_mm=args.closure_thresh_mm,
+                closure_max_bad_frac=args.closure_max_bad_frac,
+                closure_mode=args.closure_mode,
                 corridors=args.corridors,
                 buffer_m=args.buffer_m,
                 ramp_order=args.ramp_order,
                 vel_alert_mm_yr=args.vel_alert_mm_yr,
                 accel_alert_mm_yr2=args.accel_alert_mm_yr2,
+                min_alert_snr=args.min_alert_snr,
+                min_alert_span_days=args.min_alert_span_days,
             )
         ]
 

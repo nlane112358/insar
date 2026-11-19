@@ -1,10 +1,8 @@
 #include "insar/app/insar_application.hpp"
 
 #include "insar/engine/cpu_insar_engine.hpp"
-#include "insar/engine/phase_calibrator.hpp"
 #include "insar/io/gdal_slc_source.hpp"
 #include "insar/io/product_exporter.hpp"
-#include "insar/io/synthetic_slc_source.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -24,12 +22,6 @@ InsarApplication::InsarApplication(CliOptions options)
 }
 
 std::unique_ptr<ISlcSource> InsarApplication::create_slc_source() const {
-    if (options_.is_synthetic()) {
-        return std::make_unique<SyntheticSlcSource>(
-            options_.synth_width,
-            options_.synth_height,
-            options_.wavelength_mm);
-    }
     return std::make_unique<GdalSlcSource>(
         options_.slc1_path,
         options_.slc2_path,
@@ -46,14 +38,8 @@ int InsarApplication::run() const {
     const ProcessingConfig config = options_.to_processing_config();
     auto source = create_slc_source();
 
-    if (options_.is_synthetic()) {
-        std::printf("%s\n", source->describe(threads).c_str());
-    }
-
     const SlcPair pair = source->load();
-    if (!options_.is_synthetic()) {
-        std::printf("%s\n", source->describe(threads).c_str());
-    }
+    std::printf("%s\n", source->describe(threads).c_str());
 
     const int out_w = std::max(1, pair.width() / config.stride_x);
     const int out_h = std::max(1, pair.height() / config.stride_y);
@@ -76,16 +62,6 @@ int InsarApplication::run() const {
                 stats.iterations, stats.unwrap_ms, stats.rel_residual);
     std::printf("Total CPU Compute Time:                  %8.2f ms\n",
                 stats.ifg_ms + stats.unwrap_ms);
-
-    const auto truth = source->ground_truth();
-    if (truth.has_value() && config.stride_x == 1 && config.stride_y == 1) {
-        const double rmse_mm = PhaseCalibrator::compute_coherent_rmse_mm(
-            products.unwrapped_phase,
-            products.valid_mask,
-            *truth,
-            config.wavelength_mm);
-        std::printf("Coherent-Area LOS Accuracy (C-band):     %8.2f mm RMSE\n", rmse_mm);
-    }
     std::printf("------------------------------------------------------------\n");
 
     const io::ProductExporter exporter(options_.alert_threshold_mm, options_.min_alert_coh);

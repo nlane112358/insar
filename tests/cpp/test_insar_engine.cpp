@@ -10,7 +10,6 @@
 #include "insar/io/gdal_slc_source.hpp"
 #include "insar/io/gdal_utils.hpp"
 #include "insar/io/product_exporter.hpp"
-#include "insar/io/synthetic_slc_source.hpp"
 #include "insar/math/fft.hpp"
 
 #include <cmath>
@@ -174,32 +173,64 @@ void test_pcg_unwrapper_polymorphic_preconditioner() {
     TEST_CHECK(std::abs(dy - 0.25f) < 1e-3f);
 }
 
-void test_synthetic_engine_end_to_end() {
-    insar::SyntheticSlcSource source(450, 350, 55.4658f);
-    const insar::SlcPair pair = source.load();
-    const auto truth = source.ground_truth();
-    TEST_CHECK(truth.has_value());
+void test_engine_end_to_end() {
+    const int w = 128;
+    const int h = 128;
+    const float wl = 55.4658f;
+    const float mm_to_rad = (4.0f * insar::math::kPi) / wl;
+
+    insar::GeoMetadata meta;
+    meta.width = w;
+    meta.height = h;
+    meta.has_georef = true;
+    meta.geotransform = {480000.0, 10.0, 0.0, 2155000.0, 0.0, -10.0};
+    meta.projection_wkt = "EPSG:32614";
+
+    std::vector<insar::Complex> slc1(w * h, insar::Complex(0.0f, 0.0f));
+    std::vector<insar::Complex> slc2(w * h, insar::Complex(0.0f, 0.0f));
+    auto expected_disp_mm = [](int x, int y) {
+        const float dx = static_cast<float>(x - 64);
+        const float dy = static_cast<float>(y - 64);
+        return -40.0f * std::exp(-(dx * dx + dy * dy) / (2.0f * 16.0f * 16.0f));
+    };
+
+    for (int y = 8; y < h - 8; ++y) {
+        for (int x = 8; x < w - 8; ++x) {
+            const size_t idx = static_cast<size_t>(y) * w + x;
+            const float phi = expected_disp_mm(x, y) * mm_to_rad;
+            slc1[idx] = insar::Complex(std::cos(phi), std::sin(phi));
+            slc2[idx] = insar::Complex(1.0f, 0.0f);
+        }
+    }
+
+    insar::SlcPair pair{
+        insar::SlcRaster(meta, std::move(slc1)),
+        insar::SlcRaster(meta, std::move(slc2))
+    };
 
     insar::ProcessingConfig cfg;
     cfg.stride_x = 1;
     cfg.stride_y = 1;
-    cfg.look_rx = 3;
-    cfg.look_ry = 3;
-    cfg.max_iters = 40;
+    cfg.look_rx = 2;
+    cfg.look_ry = 2;
+    cfg.max_iters = 60;
+    cfg.wavelength_mm = wl;
 
-    insar::CpuInsarEngine engine(450, 350);
-    TEST_CHECK(engine.padded_width() == 512);
-    TEST_CHECK(engine.padded_height() == 512);
+    insar::CpuInsarEngine engine(w, h);
+    TEST_CHECK(engine.padded_width() == 128);
+    TEST_CHECK(engine.padded_height() == 128);
 
     const insar::InsarProducts products = engine.process(pair, cfg);
-    TEST_CHECK(products.metadata.width == 450);
-    TEST_CHECK(products.metadata.height == 350);
-    TEST_CHECK(products.stats.valid_pixels > 100000);
-    TEST_CHECK(products.displacement_mm.size() == 450u * 350u);
+    TEST_CHECK(products.metadata.width == w);
+    TEST_CHECK(products.metadata.height == h);
+    TEST_CHECK(products.stats.valid_pixels > 10000);
+    TEST_CHECK(products.displacement_mm.size() == static_cast<size_t>(w) * h);
+    TEST_CHECK(products.valid_mask[0] == 0);
+    TEST_CHECK(products.valid_mask[64 * w + 64] == 1);
 
-    const double rmse_mm = insar::PhaseCalibrator::compute_coherent_rmse_mm(
-        products.unwrapped_phase, products.valid_mask, *truth, cfg.wavelength_mm);
-    TEST_CHECK(rmse_mm < 1.0);
+    const float got_diff = products.displacement_mm[64 * w + 64] - products.displacement_mm[20 * w + 20];
+    const float exp_diff = expected_disp_mm(64, 64) - expected_disp_mm(20, 20);
+    TEST_CHECK(std::abs(got_diff - exp_diff) < 1.0f);
 }
 
 class RecordingRasterWriter final : public insar::io::IRasterWriter {
@@ -309,24 +340,105 @@ void test_gdal_cog_writer_and_slc_source() {
 
 void test_cli_parser() {
     const char* argv[] = {
-        "insar_proto", "--width", "256", "--height", "128", "--window", "1", "2", "3", "4"
+        "insar_proto", "--slc1", "ref.h5", "--slc2", "sec.h5", "--window", "1", "2", "3", "4"
     };
     const auto opts = insar::app::CliParser::parse(10, const_cast<char**>(argv));
-    TEST_CHECK(opts.synth_width == 256);
-    TEST_CHECK(opts.synth_height == 128);
+    TEST_CHECK(opts.slc1_path == "ref.h5");
+    TEST_CHECK(opts.slc2_path == "sec.h5");
     TEST_CHECK(opts.window.x == 1 && opts.window.y == 2 && opts.window.width == 3 && opts.window.height == 4);
-    TEST_CHECK(opts.is_synthetic());
-    TEST_CHECK(opts.resolved_stride_x() == 1);
-    TEST_CHECK(opts.resolved_stride_y() == 1);
+    TEST_CHECK(opts.resolved_stride_x() == 6);
+    TEST_CHECK(opts.resolved_stride_y() == 3);
+
+    const char* help_argv[] = {"insar_proto", "--help"};
+    const auto help_opts = insar::app::CliParser::parse(2, const_cast<char**>(help_argv));
+    TEST_CHECK(help_opts.show_help);
+
+    auto expect_invalid = [](int argc, const char** args) {
+        bool threw = false;
+        try {
+            (void)insar::app::CliParser::parse(argc, const_cast<char**>(args));
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TEST_CHECK(threw);
+    };
+
+    const char* no_slcs_argv[] = {"insar_proto"};
+    expect_invalid(1, no_slcs_argv);
+
+    const char* one_slc_argv[] = {"insar_proto", "--slc1", "ref.h5"};
+    expect_invalid(3, one_slc_argv);
+
+    const char* synth_flag_argv[] = {"insar_proto", "--slc1", "ref.h5", "--slc2", "sec.h5", "--width", "256"};
+    expect_invalid(7, synth_flag_argv);
 
     const char* bad_argv[] = {"insar_proto", "--unknown-flag"};
-    bool threw = false;
-    try {
-        (void)insar::app::CliParser::parse(2, const_cast<char**>(bad_argv));
-    } catch (const std::invalid_argument&) {
-        threw = true;
+    expect_invalid(2, bad_argv);
+}
+
+void test_phase_calibrator_reference_region_pinning() {
+    insar::io::ensure_gdal_registered();
+    const int w = 64;
+    const int h = 64;
+    insar::GeoMetadata meta;
+    meta.width = w;
+    meta.height = h;
+    meta.has_georef = true;
+    meta.geotransform = {480000.0, 30.0, 0.0, 2155000.0, 0.0, -30.0};
+    meta.projection_wkt = "EPSG:32614";
+
+    const float wl = 55.4658f;
+    const float mm_to_rad = (4.0f * insar::math::kPi) / wl;
+    std::vector<float> phase(w * h, 0.0f);
+    std::vector<float> coh(w * h, 0.9f);
+    std::vector<uint8_t> mask(w * h, 1);
+
+    // 70% of scene subsides by +50 mm, while a stable western rock patch (x < 16) is at +5 mm raw offset
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const float mm = (x < 16) ? 5.0f : 55.0f;
+            phase[static_cast<size_t>(y) * w + x] = mm * mm_to_rad;
+        }
     }
-    TEST_CHECK(threw);
+
+    // Whole-scene median pins to 55 mm (wrongly making the subsiding basin look like 0 mm!)
+    const auto scene_med = insar::PhaseCalibrator::to_displacement_mm(phase, coh, mask, wl, 0.65f);
+    TEST_CHECK(std::abs(scene_med[32 * w + 40]) < 1e-3f);
+
+    // Pixel reference disk inside stable bedrock pins x < 16 to 0 mm and basin to +50 mm
+    insar::ReferenceRegionConfig ref_px;
+    ref_px.enabled = true;
+    ref_px.is_lonlat = false;
+    ref_px.px = 8;
+    ref_px.py = 32;
+    ref_px.radius_px = 4;
+    size_t ref_cnt = 0;
+    bool pinned = false;
+    const auto pinned_px = insar::PhaseCalibrator::to_displacement_mm(
+        phase, coh, mask, meta, wl, 0.65f, ref_px, &ref_cnt, &pinned);
+    TEST_CHECK(pinned);
+    TEST_CHECK(ref_cnt > 20);
+    TEST_CHECK(std::abs(pinned_px[32 * w + 8]) < 1e-3f);
+    TEST_CHECK(std::abs(pinned_px[32 * w + 40] - 50.0f) < 1e-2f);
+
+    // WGS84 lon/lat reference region resolves back to the same stable bedrock patch
+    insar::io::GeoCoordinateTransformer transformer(meta);
+    double ref_lon = 0.0, ref_lat = 0.0;
+    TEST_CHECK(transformer.pixel_to_lonlat(8.5, 32.5, ref_lon, ref_lat));
+    insar::ReferenceRegionConfig ref_ll;
+    ref_ll.enabled = true;
+    ref_ll.is_lonlat = true;
+    ref_ll.lon = ref_lon;
+    ref_ll.lat = ref_lat;
+    ref_ll.radius_m = 150.0;
+    size_t ll_cnt = 0;
+    bool ll_pinned = false;
+    const auto pinned_ll = insar::PhaseCalibrator::to_displacement_mm(
+        phase, coh, mask, meta, wl, 0.65f, ref_ll, &ll_cnt, &ll_pinned);
+    TEST_CHECK(ll_pinned);
+    TEST_CHECK(ll_cnt > 20);
+    TEST_CHECK(std::abs(pinned_ll[32 * w + 8]) < 1e-3f);
+    TEST_CHECK(std::abs(pinned_ll[32 * w + 40] - 50.0f) < 1e-2f);
 }
 
 } // namespace
@@ -337,10 +449,11 @@ int main() {
     test_weighted_laplacian_symmetry();
     test_geo_metadata_transforms();
     test_pcg_unwrapper_polymorphic_preconditioner();
-    test_synthetic_engine_end_to_end();
+    test_engine_end_to_end();
     test_anomaly_detector_and_exporter();
     test_gdal_cog_writer_and_slc_source();
     test_cli_parser();
+    test_phase_calibrator_reference_region_pinning();
 
     std::printf("All insar C++ unit tests passed.\n");
     return 0;

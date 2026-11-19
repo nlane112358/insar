@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@
 #include "cpl_string.h"
 #include "gdal_alg.h"
 #include "gdal_priv.h"
+#include "gdalwarper.h"
 #include "ogr_api.h"
 #include "ogr_spatialref.h"
 #include "ogrsf_frmts.h"
@@ -32,7 +34,8 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr double kDaysPerYear = 365.25;
-constexpr double kNanF = std::numeric_limits<float>::quiet_NaN();
+constexpr double kPi = 3.14159265358979323846;
+constexpr float kNanF = std::numeric_limits<float>::quiet_NaN();
 constexpr double kNanD = std::numeric_limits<double>::quiet_NaN();
 
 enum StateBands : int {
@@ -92,6 +95,37 @@ struct StackMetadata {
     double last_t1_days = 0.0;
     double sum_dt_days = 0.0;
     int pair_count = 0;
+    int redundant_pair_count = 0;
+    int rejected_pair_count = 0;
+};
+
+struct ClosureTripletSpec {
+    std::string disp_a_path;
+    std::string disp_b_path;
+    std::string mode; // "add_sub" => d_P + d_a - d_b; "sum_sub" => d_a + d_b - d_P
+};
+
+struct ClosureResult {
+    int triplets_evaluated = 0;
+    size_t evaluated_coherent_pixels = 0;
+    size_t masked_pixels = 0;
+    double bad_fraction = 0.0;
+    double rms_mm = kNanD;
+    double thresh_mm = 10.0;
+    double max_bad_frac = 0.35;
+    std::string mode = "consensus";
+    bool pair_rejected = false;
+};
+
+struct ReferencePinResult {
+    bool configured = false;
+    bool applied = false;
+    std::string mode = "none";
+    double lon = kNanD;
+    double lat = kNanD;
+    double radius_m = kNanD;
+    size_t ref_pixels_used = 0;
+    double offset_mm = 0.0;
 };
 
 struct RampResult {
@@ -100,6 +134,14 @@ struct RampResult {
     double rms_before_mm = 0.0;
     double rms_after_mm = 0.0;
     std::vector<double> coeffs;
+    size_t masked_deform_pixels = 0;
+    double masked_deform_fraction = 0.0;
+    bool dem_applied = false;
+    double dem_slope_mm_per_km = kNanD;
+    double dem_corr_before = kNanD;
+    double dem_corr_after = kNanD;
+    double dem_mean_m = kNanD;
+    double dem_std_m = kNanD;
 };
 
 struct CorridorMetric {
@@ -112,17 +154,21 @@ struct CorridorMetric {
     int valid_pixels = 0;
     int high_coh_pixels = 0;
     int alert_pixel_count = 0;
+    int snr_gated_pixels = 0;
     double coverage_ratio = 0.0;
     double mean_coherence = kNanD;
     double mean_velocity_mm_yr = kNanD;
     double min_velocity_mm_yr = kNanD;
     double max_velocity_mm_yr = kNanD;
     double p95_abs_velocity_mm_yr = kNanD;
+    double mean_snr = kNanD;
+    double p95_snr = kNanD;
     double mean_cumulative_disp_mm = kNanD;
     double max_abs_cumulative_disp_mm = kNanD;
     double mean_acceleration_mm_yr2 = kNanD;
     double max_abs_acceleration_mm_yr2 = kNanD;
     double latest_interval_disp_mm = kNanD;
+    bool maturity_gated = false;
     std::string risk_level = "no_coverage";
 };
 
@@ -136,6 +182,8 @@ struct AlertPoint {
     double cumulative_disp_mm = 0.0;
     double temporal_coherence = 0.0;
     double uncertainty_mm_yr = kNanD;
+    double velocity_snr = kNanD;
+    std::string severity = "critical";
     std::string corridor_asset_id;
     std::string corridor_name;
     double score = 0.0;
@@ -147,16 +195,43 @@ struct Options {
     std::string coh_path;
     std::string out_dir;
     std::string corridors_path;
+    std::string dem_path;
+    std::string deform_mask_path;
+    std::string prior_vel_path;
+    std::string ref_region_path;
+    bool has_ref_lonlat = false;
+    double ref_lon = 0.0;
+    double ref_lat = 0.0;
+    double ref_radius_m = 1000.0;
+    bool has_ref_px = false;
+    int ref_px = 0;
+    int ref_py = 0;
+    int ref_radius_px = 10;
+
     double dt_days = -1.0;
     double t0_days = kNanD;
     double t1_days = kNanD;
     int ramp_order = 1;
     float min_coh = 0.35f;
+    float ramp_deform_vel_mm_yr = 25.0f;
+    float ramp_mask_sigma = 2.5f;
+    int ramp_mask_dilate_px = 2;
+
+    std::vector<ClosureTripletSpec> closure_triplets;
+    float closure_thresh_mm = 10.0f;
+    float closure_max_bad_frac = 0.35f;
+    std::string closure_mode = "consensus";
+    bool redundant_pair = false;
+    double pair_weight_scale = 1.0;
+
     double buffer_m = 100.0;
     float vel_alert_mm_yr = 15.0f;
     float accel_alert_mm_yr2 = 25.0f;
     float min_alert_coh = 0.55f;
-    double max_missing_frac = 0.6;
+    float min_alert_snr = 2.5f;
+    double min_alert_span_days = 60.0;
+    int min_alert_passes = 0;
+
     bool export_ramp_disp = true;
     bool no_export = false;
     bool skip_cog = false;
@@ -196,7 +271,7 @@ std::string json_num(double v, int prec = 4) {
 void print_usage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n"
-        << "Sequential O(1) InSAR stacking, ramp removal, and vector corridor analytics.\n\n"
+        << "Sequential O(1) InSAR stacking, DEM tropospheric correction, triplet closure, and corridor analytics.\n\n"
         << "Required:\n"
         << "  --state <stack_state.tif>     Persistent Float64 sufficient-statistics raster\n"
         << "  --disp <displacement_mm.tif>  Input unwrapped pair displacement GeoTIFF (mm)\n"
@@ -204,14 +279,35 @@ void print_usage(const char* argv0) {
         << "  --dt-days <double>            Acquisition baseline duration (days), OR\n"
         << "  --t0-days <d0> --t1-days <d1> Explicit epoch bounds relative to stack t=0 (days)\n"
         << "  --out-dir <dir>               Output directory for derived COGs & corridor JSONs\n\n"
-        << "Optional:\n"
-        << "  --ramp-order <0|1|2>          Coherence-weighted Huber IRLS ramp order (-1=off, default 1)\n"
+        << "Reference & Ramp / Tropospheric Correction:\n"
+        << "  --ramp-order <-1|0|1|2>       Robust Huber/Tukey IRLS ramp order (-1=off, default 1)\n"
         << "  --min-coh <float>             Minimum coherence for ramp fit & stack update (default 0.35)\n"
+        << "  --dem <dem.tif>               DEM GeoTIFF (local/SRTM/Copernicus) for elevation-correlated tropo removal\n"
+        << "  --ref-lonlat <lon> <lat>      Pin zero datum to known stable WGS84 reference region\n"
+        << "  --ref-radius-m <double>       Radius in meters for --ref-lonlat (default 1000.0)\n"
+        << "  --ref-px <x> <y> <r>          Pin zero datum to pixel disk (x, y, radius_px)\n"
+        << "  --ref-region <path>           Vector polygon (GeoJSON/GPKG) of known stable reference region\n"
+        << "  --deform-mask <path>          Vector polygon or raster mask of high-deformation zones to exclude from ramp fit\n"
+        << "  --prior-vel <vel.tif>         Optional prior velocity raster for masking |v| >= --ramp-deform-vel-mm-yr\n"
+        << "  --ramp-deform-vel-mm-yr <f>   Velocity threshold (mm/yr) to auto-mask deforming pixels before ramp fit (default 25.0)\n"
+        << "  --ramp-mask-sigma <float>     Single-pair residual MAD multiplier for masking deformation before final fit (default 2.5)\n"
+        << "  --ramp-mask-dilate-px <int>   Dilation radius (px) around masked deformation zones (default 2)\n\n"
+        << "Triplet Phase Closure & Redundant Pairs:\n"
+        << "  --closure-triplet <a> <b> <m> Check triplet closure (m='add_sub': d+da-db, m='sum_sub': da+db-d); repeatable\n"
+        << "  --closure-thresh-mm <float>   Per-pixel |closure| threshold in mm to mask unwrapping errors (default 10.0)\n"
+        << "  --closure-max-bad-frac <f>    Reject entire pair if bad coherent pixel fraction exceeds this (default 0.35)\n"
+        << "  --closure-mode <m>            'consensus' (majority fail, default) or 'strict' (any triplet fail)\n"
+        << "  --redundant-pair              Update WLS velocity/accel normal eqs without double-counting cumulative span\n"
+        << "  --pair-weight-scale <double>  Weight multiplier for pair normal equations (default 1.0)\n\n"
+        << "Corridors & Alert Maturity / SNR Gating:\n"
         << "  --corridors <path>            Vector file (GeoJSON/GPKG) of infrastructure corridors\n"
         << "  --buffer-m <double>           Metric corridor buffer radius in meters (default 100.0)\n"
         << "  --vel-alert-mm-yr <float>     |Velocity| alert threshold in mm/yr (default 15.0)\n"
         << "  --accel-alert-mm-yr2 <float>  |Acceleration| alert threshold in mm/yr^2 (default 25.0)\n"
         << "  --min-alert-coh <float>       Minimum temporal coherence for alerts (default 0.55)\n"
+        << "  --min-alert-snr <float>       Minimum velocity SNR |v|/sigma_v for alerts (default 2.5)\n"
+        << "  --min-alert-span-days <d>     Minimum stack span (days) before issuing critical alerts (default 60.0)\n"
+        << "  --min-alert-passes <int>      Minimum valid stacked pairs at a pixel for alerts (0=auto)\n"
         << "  --no-export                   Update state raster only without exporting outputs\n"
         << "  --skip-cog                    Export corridor JSONs/summary without encoding COGs\n"
         << "  --help                        Show this help text\n";
@@ -240,6 +336,25 @@ Options parse_args(int argc, char** argv) {
             opt.out_dir = need_val(i, "--out-dir");
         } else if (arg == "--corridors") {
             opt.corridors_path = need_val(i, "--corridors");
+        } else if (arg == "--dem") {
+            opt.dem_path = need_val(i, "--dem");
+        } else if (arg == "--deform-mask") {
+            opt.deform_mask_path = need_val(i, "--deform-mask");
+        } else if (arg == "--prior-vel") {
+            opt.prior_vel_path = need_val(i, "--prior-vel");
+        } else if (arg == "--ref-region") {
+            opt.ref_region_path = need_val(i, "--ref-region");
+        } else if (arg == "--ref-lonlat") {
+            opt.has_ref_lonlat = true;
+            opt.ref_lon = std::stod(need_val(i, "--ref-lonlat lon"));
+            opt.ref_lat = std::stod(need_val(i, "--ref-lonlat lat"));
+        } else if (arg == "--ref-radius-m") {
+            opt.ref_radius_m = std::stod(need_val(i, "--ref-radius-m"));
+        } else if (arg == "--ref-px") {
+            opt.has_ref_px = true;
+            opt.ref_px = std::stoi(need_val(i, "--ref-px x"));
+            opt.ref_py = std::stoi(need_val(i, "--ref-px y"));
+            opt.ref_radius_px = std::stoi(need_val(i, "--ref-px r"));
         } else if (arg == "--dt-days") {
             opt.dt_days = std::stod(need_val(i, "--dt-days"));
         } else if (arg == "--t0-days") {
@@ -250,6 +365,34 @@ Options parse_args(int argc, char** argv) {
             opt.ramp_order = std::stoi(need_val(i, "--ramp-order"));
         } else if (arg == "--min-coh") {
             opt.min_coh = std::stof(need_val(i, "--min-coh"));
+        } else if (arg == "--ramp-deform-vel-mm-yr") {
+            opt.ramp_deform_vel_mm_yr = std::stof(need_val(i, "--ramp-deform-vel-mm-yr"));
+        } else if (arg == "--ramp-mask-sigma") {
+            opt.ramp_mask_sigma = std::stof(need_val(i, "--ramp-mask-sigma"));
+        } else if (arg == "--ramp-mask-dilate-px") {
+            opt.ramp_mask_dilate_px = std::stoi(need_val(i, "--ramp-mask-dilate-px"));
+        } else if (arg == "--closure-triplet") {
+            ClosureTripletSpec spec;
+            spec.disp_a_path = need_val(i, "--closure-triplet disp_a");
+            spec.disp_b_path = need_val(i, "--closure-triplet disp_b");
+            spec.mode = need_val(i, "--closure-triplet mode");
+            if (spec.mode != "add_sub" && spec.mode != "sum_sub") {
+                throw std::runtime_error("--closure-triplet mode must be 'add_sub' or 'sum_sub'");
+            }
+            opt.closure_triplets.push_back(std::move(spec));
+        } else if (arg == "--closure-thresh-mm") {
+            opt.closure_thresh_mm = std::stof(need_val(i, "--closure-thresh-mm"));
+        } else if (arg == "--closure-max-bad-frac") {
+            opt.closure_max_bad_frac = std::stof(need_val(i, "--closure-max-bad-frac"));
+        } else if (arg == "--closure-mode") {
+            opt.closure_mode = need_val(i, "--closure-mode");
+            if (opt.closure_mode != "consensus" && opt.closure_mode != "strict") {
+                throw std::runtime_error("--closure-mode must be 'consensus' or 'strict'");
+            }
+        } else if (arg == "--redundant-pair") {
+            opt.redundant_pair = true;
+        } else if (arg == "--pair-weight-scale") {
+            opt.pair_weight_scale = std::stod(need_val(i, "--pair-weight-scale"));
         } else if (arg == "--buffer-m") {
             opt.buffer_m = std::stod(need_val(i, "--buffer-m"));
         } else if (arg == "--vel-alert-mm-yr") {
@@ -258,6 +401,12 @@ Options parse_args(int argc, char** argv) {
             opt.accel_alert_mm_yr2 = std::stof(need_val(i, "--accel-alert-mm-yr2"));
         } else if (arg == "--min-alert-coh") {
             opt.min_alert_coh = std::stof(need_val(i, "--min-alert-coh"));
+        } else if (arg == "--min-alert-snr") {
+            opt.min_alert_snr = std::stof(need_val(i, "--min-alert-snr"));
+        } else if (arg == "--min-alert-span-days") {
+            opt.min_alert_span_days = std::stod(need_val(i, "--min-alert-span-days"));
+        } else if (arg == "--min-alert-passes") {
+            opt.min_alert_passes = std::stoi(need_val(i, "--min-alert-passes"));
         } else if (arg == "--no-export") {
             opt.no_export = true;
         } else if (arg == "--skip-cog") {
@@ -289,6 +438,18 @@ Options parse_args(int argc, char** argv) {
     }
     if (opt.ramp_order < -1 || opt.ramp_order > 2) {
         throw std::runtime_error("--ramp-order must be -1, 0, 1, or 2");
+    }
+    if (opt.has_ref_lonlat && opt.ref_radius_m <= 0.0) {
+        throw std::runtime_error("--ref-radius-m must be positive");
+    }
+    if (opt.has_ref_px && opt.ref_radius_px <= 0) {
+        throw std::runtime_error("--ref-px radius must be positive");
+    }
+    if (opt.pair_weight_scale <= 0.0) {
+        throw std::runtime_error("--pair-weight-scale must be positive");
+    }
+    if (opt.closure_thresh_mm <= 0.0f) {
+        throw std::runtime_error("--closure-thresh-mm must be positive");
     }
     return opt;
 }
@@ -329,6 +490,148 @@ std::vector<float> read_single_band_f32(const std::string& path, RasterMeta& met
                 buf[i] = kNanF;
             }
         }
+    }
+    return buf;
+}
+
+bool grids_match(const RasterMeta& a, const RasterMeta& b) {
+    if (a.width != b.width || a.height != b.height) {
+        return false;
+    }
+    for (int k = 0; k < 6; ++k) {
+        double tol = std::max(1e-4, std::abs(a.geotransform[k]) * 1e-6);
+        if (std::abs(a.geotransform[k] - b.geotransform[k]) > tol) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void assert_compatible_grid(const RasterMeta& a, const RasterMeta& b, const char* label) {
+    if (a.width != b.width || a.height != b.height) {
+        throw std::runtime_error(
+            std::string("Dimension mismatch for ") + label + ": expected " +
+            std::to_string(a.width) + "x" + std::to_string(a.height) + ", got " +
+            std::to_string(b.width) + "x" + std::to_string(b.height));
+    }
+    for (int k = 0; k < 6; ++k) {
+        double tol = std::max(1e-4, std::abs(a.geotransform[k]) * 1e-6);
+        if (std::abs(a.geotransform[k] - b.geotransform[k]) > tol) {
+            throw std::runtime_error(std::string("GeoTransform mismatch for ") + label);
+        }
+    }
+}
+
+std::vector<float> read_raster_aligned_f32(
+    const std::string& path,
+    const RasterMeta& target_meta,
+    GDALResampleAlg resample_alg = GRA_Bilinear
+) {
+    UniqueGdalDataset src_ds(static_cast<GDALDataset*>(GDALOpen(path.c_str(), GA_ReadOnly)));
+    if (!src_ds) {
+        throw std::runtime_error("Failed to open auxiliary raster: " + path);
+    }
+    RasterMeta src_meta;
+    src_meta.width = src_ds->GetRasterXSize();
+    src_meta.height = src_ds->GetRasterYSize();
+    const bool has_gt = (src_ds->GetGeoTransform(src_meta.geotransform) == CE_None);
+    const char* src_proj = src_ds->GetProjectionRef();
+    src_meta.wkt = (src_proj != nullptr) ? src_proj : "";
+
+    bool same_crs = (src_meta.wkt == target_meta.wkt);
+    if (!same_crs && !src_meta.wkt.empty() && !target_meta.wkt.empty()) {
+        OGRSpatialReference s1, s2;
+        if (s1.importFromWkt(src_meta.wkt.c_str()) == OGRERR_NONE &&
+            s2.importFromWkt(target_meta.wkt.c_str()) == OGRERR_NONE) {
+            same_crs = (s1.IsSame(&s2) != 0);
+        }
+    }
+    if (has_gt && grids_match(src_meta, target_meta) && (same_crs || src_meta.wkt.empty() || target_meta.wkt.empty())) {
+        src_ds.reset();
+        RasterMeta dummy;
+        return read_single_band_f32(path, dummy);
+    }
+
+    GDALDriver* mem_drv = GetGDALDriverManager()->GetDriverByName("MEM");
+    if (mem_drv == nullptr) {
+        throw std::runtime_error("GDAL MEM driver unavailable for reprojection");
+    }
+    UniqueGdalDataset dst_ds(mem_drv->Create("", target_meta.width, target_meta.height, 1, GDT_Float32, nullptr));
+    if (!dst_ds) {
+        throw std::runtime_error("Failed creating MEM dataset for aligned raster: " + path);
+    }
+    double gt[6];
+    std::memcpy(gt, target_meta.geotransform, sizeof(gt));
+    dst_ds->SetGeoTransform(gt);
+    if (!target_meta.wkt.empty()) {
+        dst_ds->SetProjection(target_meta.wkt.c_str());
+    }
+
+    const size_t npix = static_cast<size_t>(target_meta.width) * static_cast<size_t>(target_meta.height);
+    std::vector<float> buf(npix, kNanF);
+    GDALRasterBand* dst_band = dst_ds->GetRasterBand(1);
+    dst_band->SetNoDataValue(kNanF);
+    if (dst_band->RasterIO(
+            GF_Write, 0, 0, target_meta.width, target_meta.height,
+            buf.data(), target_meta.width, target_meta.height,
+            GDT_Float32, 0, 0, nullptr) != CE_None) {
+        throw std::runtime_error("Failed initializing aligned raster buffer");
+    }
+
+    GDALWarpOptions* warp_opts = GDALCreateWarpOptions();
+    warp_opts->hSrcDS = src_ds.get();
+    warp_opts->hDstDS = dst_ds.get();
+    warp_opts->nBandCount = 1;
+    warp_opts->panSrcBands = static_cast<int*>(CPLMalloc(sizeof(int)));
+    warp_opts->panDstBands = static_cast<int*>(CPLMalloc(sizeof(int)));
+    warp_opts->panSrcBands[0] = 1;
+    warp_opts->panDstBands[0] = 1;
+    warp_opts->eResampleAlg = resample_alg;
+    warp_opts->eWorkingDataType = GDT_Float32;
+    warp_opts->pfnProgress = GDALDummyProgress;
+
+    int has_src_nd = 0;
+    double src_nd = src_ds->GetRasterBand(1)->GetNoDataValue(&has_src_nd);
+    if (has_src_nd) {
+        warp_opts->padfSrcNoDataReal = static_cast<double*>(CPLMalloc(sizeof(double)));
+        warp_opts->padfSrcNoDataReal[0] = src_nd;
+    }
+    warp_opts->padfDstNoDataReal = static_cast<double*>(CPLMalloc(sizeof(double)));
+    warp_opts->padfDstNoDataReal[0] = kNanD;
+
+    char** w_str = nullptr;
+    w_str = CSLSetNameValue(w_str, "INIT_DEST", "NO_DATA");
+    w_str = CSLSetNameValue(w_str, "NUM_THREADS", "ALL_CPUS");
+    warp_opts->papszWarpOptions = w_str;
+
+    const char* effective_src_wkt = src_meta.wkt.empty() ? nullptr : src_meta.wkt.c_str();
+    const char* effective_dst_wkt = target_meta.wkt.empty() ? nullptr : target_meta.wkt.c_str();
+    warp_opts->pTransformerArg = GDALCreateGenImgProjTransformer(
+        src_ds.get(), effective_src_wkt, dst_ds.get(), effective_dst_wkt, FALSE, 0.0, 1);
+    if (warp_opts->pTransformerArg == nullptr) {
+        GDALDestroyWarpOptions(warp_opts);
+        throw std::runtime_error("Failed creating GDAL image projection transformer for: " + path);
+    }
+    warp_opts->pfnTransformer = GDALGenImgProjTransform;
+
+    GDALWarpOperation warp_op;
+    CPLErr init_err = warp_op.Initialize(warp_opts);
+    CPLErr warp_err = CE_Failure;
+    if (init_err == CE_None) {
+        warp_err = warp_op.ChunkAndWarpImage(0, 0, target_meta.width, target_meta.height);
+    }
+    GDALDestroyGenImgProjTransformer(warp_opts->pTransformerArg);
+    warp_opts->pTransformerArg = nullptr;
+    GDALDestroyWarpOptions(warp_opts);
+    if (init_err != CE_None || warp_err != CE_None) {
+        throw std::runtime_error("GDAL warp failed while aligning raster: " + path);
+    }
+
+    if (dst_band->RasterIO(
+            GF_Read, 0, 0, target_meta.width, target_meta.height,
+            buf.data(), target_meta.width, target_meta.height,
+            GDT_Float32, 0, 0, nullptr) != CE_None) {
+        throw std::runtime_error("Failed reading warped raster buffer: " + path);
     }
     return buf;
 }
@@ -428,6 +731,8 @@ void read_state_raster(
     smeta.last_t1_days = read_meta_d("STACK_LAST_T1_DAYS", 0.0);
     smeta.sum_dt_days = read_meta_d("STACK_SUM_DT_DAYS", 0.0);
     smeta.pair_count = read_meta_i("STACK_PAIR_COUNT", 0);
+    smeta.redundant_pair_count = read_meta_i("STACK_REDUNDANT_PAIR_COUNT", 0);
+    smeta.rejected_pair_count = read_meta_i("STACK_REJECTED_PAIR_COUNT", 0);
 
     const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
     state_bands.assign(static_cast<size_t>(kNumStateBands) * npix, 0.0);
@@ -483,6 +788,8 @@ void write_state_raster(
     ds->SetMetadataItem("STACK_LAST_T1_DAYS", std::to_string(smeta.last_t1_days).c_str());
     ds->SetMetadataItem("STACK_SUM_DT_DAYS", std::to_string(smeta.sum_dt_days).c_str());
     ds->SetMetadataItem("STACK_PAIR_COUNT", std::to_string(smeta.pair_count).c_str());
+    ds->SetMetadataItem("STACK_REDUNDANT_PAIR_COUNT", std::to_string(smeta.redundant_pair_count).c_str());
+    ds->SetMetadataItem("STACK_REJECTED_PAIR_COUNT", std::to_string(smeta.rejected_pair_count).c_str());
 
     const char* band_names[kNumStateBands] = {
         "sum_w", "S_11", "S_12", "S_22", "b_1", "b_2", "S_yy",
@@ -507,19 +814,442 @@ void write_state_raster(
     fs::rename(tmp_path, state_path);
 }
 
-void assert_compatible_grid(const RasterMeta& a, const RasterMeta& b, const char* label) {
-    if (a.width != b.width || a.height != b.height) {
-        throw std::runtime_error(
-            std::string("Dimension mismatch for ") + label + ": expected " +
-            std::to_string(a.width) + "x" + std::to_string(a.height) + ", got " +
-            std::to_string(b.width) + "x" + std::to_string(b.height));
+double meters_to_crs_units(const OGRSpatialReference& srs, double meters, double center_lat_deg) {
+    if (srs.IsProjected()) {
+        double lin = srs.GetLinearUnits(nullptr);
+        return (lin > 0.0) ? (meters / lin) : meters;
     }
-    for (int k = 0; k < 6; ++k) {
-        double tol = std::max(1e-4, std::abs(a.geotransform[k]) * 1e-6);
-        if (std::abs(a.geotransform[k] - b.geotransform[k]) > tol) {
-            throw std::runtime_error(std::string("GeoTransform mismatch for ") + label);
+    double cos_lat = std::max(0.2, std::cos(center_lat_deg * kPi / 180.0));
+    return meters / (111320.0 * cos_lat);
+}
+
+std::vector<uint8_t> rasterize_vector_mask(const std::string& vector_path, const RasterMeta& meta) {
+    const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
+    std::vector<uint8_t> mask(npix, 0);
+    if (meta.wkt.empty()) {
+        throw std::runtime_error("Raster has empty CRS WKT; cannot rasterize vector mask: " + vector_path);
+    }
+
+    UniqueGdalDataset vds(static_cast<GDALDataset*>(
+        GDALOpenEx(vector_path.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr)));
+    if (!vds) {
+        throw std::runtime_error("Failed to open vector mask: " + vector_path);
+    }
+
+    OGRSpatialReference dst_srs;
+    if (dst_srs.importFromWkt(meta.wkt.c_str()) != OGRERR_NONE) {
+        throw std::runtime_error("Invalid raster CRS WKT");
+    }
+    dst_srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    GDALDriver* mem_drv = GetGDALDriverManager()->GetDriverByName("MEM");
+    if (mem_drv == nullptr) {
+        throw std::runtime_error("MEM driver unavailable");
+    }
+    UniqueGdalDataset mem_ds(mem_drv->Create("", meta.width, meta.height, 1, GDT_Byte, nullptr));
+    if (!mem_ds) {
+        throw std::runtime_error("Failed allocating rasterized mask buffer");
+    }
+    double gt[6];
+    std::memcpy(gt, meta.geotransform, sizeof(gt));
+    mem_ds->SetGeoTransform(gt);
+    mem_ds->SetProjection(meta.wkt.c_str());
+    if (mem_ds->GetRasterBand(1)->RasterIO(
+            GF_Write, 0, 0, meta.width, meta.height, mask.data(),
+            meta.width, meta.height, GDT_Byte, 0, 0, nullptr) != CE_None) {
+        throw std::runtime_error("Failed initializing rasterized mask buffer");
+    }
+
+    std::vector<UniqueOgrGeom> owned_geoms;
+    std::vector<OGRGeometryH> geom_handles;
+    std::vector<double> burn_vals;
+
+    for (int li = 0; li < vds->GetLayerCount(); ++li) {
+        OGRLayer* layer = vds->GetLayer(li);
+        if (layer == nullptr) continue;
+        layer->ResetReading();
+
+        OGRSpatialReference src_srs;
+        if (layer->GetSpatialRef() != nullptr) {
+            src_srs = *(layer->GetSpatialRef());
+        } else {
+            src_srs.SetWellKnownGeogCS("WGS84");
+        }
+        src_srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        UniqueOgrCt to_dst(OGRCreateCoordinateTransformation(&src_srs, &dst_srs));
+        if (!to_dst) {
+            throw std::runtime_error("Failed creating vector->raster transform for: " + vector_path);
+        }
+
+        OGRFeature* raw_feat = nullptr;
+        while ((raw_feat = layer->GetNextFeature()) != nullptr) {
+            std::unique_ptr<OGRFeature, void(*)(OGRFeature*)> feat(raw_feat, OGRFeature::DestroyFeature);
+            OGRGeometry* g = feat->GetGeometryRef();
+            if (g == nullptr || g->IsEmpty()) continue;
+            UniqueOgrGeom g_dst(g->clone());
+            if (g_dst->transform(to_dst.get()) == OGRERR_NONE) {
+                geom_handles.push_back(OGRGeometry::ToHandle(g_dst.get()));
+                burn_vals.push_back(1.0);
+                owned_geoms.push_back(std::move(g_dst));
+            }
         }
     }
+
+    if (!geom_handles.empty()) {
+        int bands[1] = {1};
+        char** r_opts = nullptr;
+        r_opts = CSLSetNameValue(r_opts, "ALL_TOUCHED", "TRUE");
+        CPLErr err = GDALRasterizeGeometries(
+            GDALDataset::ToHandle(mem_ds.get()), 1, bands,
+            static_cast<int>(geom_handles.size()), geom_handles.data(),
+            nullptr, nullptr, burn_vals.data(), r_opts, nullptr, nullptr);
+        CSLDestroy(r_opts);
+        if (err != CE_None) {
+            throw std::runtime_error("GDALRasterizeGeometries failed on: " + vector_path);
+        }
+        if (mem_ds->GetRasterBand(1)->RasterIO(
+                GF_Read, 0, 0, meta.width, meta.height, mask.data(),
+                meta.width, meta.height, GDT_Byte, 0, 0, nullptr) != CE_None) {
+            throw std::runtime_error("Failed reading rasterized mask buffer");
+        }
+    }
+    return mask;
+}
+
+std::vector<uint8_t> load_mask_any(const std::string& path, const RasterMeta& meta) {
+    // Try vector first; if not a vector dataset, fall back to aligned raster
+    CPLPushErrorHandler(CPLQuietErrorHandler);
+    UniqueGdalDataset vds(static_cast<GDALDataset*>(
+        GDALOpenEx(path.c_str(), GDAL_OF_VECTOR, nullptr, nullptr, nullptr)));
+    CPLPopErrorHandler();
+    if (vds) {
+        vds.reset();
+        return rasterize_vector_mask(path, meta);
+    }
+    std::vector<float> r = read_raster_aligned_f32(path, meta, GRA_NearestNeighbour);
+    std::vector<uint8_t> mask(r.size(), 0);
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < r.size(); ++i) {
+        if (std::isfinite(r[i]) && r[i] > 0.5f) {
+            mask[i] = 1;
+        }
+    }
+    return mask;
+}
+
+std::vector<uint8_t> dilate_mask_box(const std::vector<uint8_t>& src, int width, int height, int radius) {
+    if (radius <= 0) {
+        return src;
+    }
+    const size_t npix = static_cast<size_t>(width) * static_cast<size_t>(height);
+    std::vector<uint8_t> horiz(npix, 0);
+    std::vector<uint8_t> out(npix, 0);
+
+    #pragma omp parallel for schedule(static)
+    for (int y = 0; y < height; ++y) {
+        const size_t row = static_cast<size_t>(y) * width;
+        int acc = 0;
+        const int r0 = std::min(width - 1, radius);
+        for (int x = 0; x <= r0; ++x) {
+            acc += src[row + x] ? 1 : 0;
+        }
+        for (int x = 0; x < width; ++x) {
+            horiz[row + x] = (acc > 0) ? 1 : 0;
+            const int leave = x - radius;
+            const int enter = x + radius + 1;
+            if (leave >= 0 && src[row + leave]) acc--;
+            if (enter < width && src[row + enter]) acc++;
+        }
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int x = 0; x < width; ++x) {
+        int acc = 0;
+        const int r0 = std::min(height - 1, radius);
+        for (int y = 0; y <= r0; ++y) {
+            acc += horiz[static_cast<size_t>(y) * width + x] ? 1 : 0;
+        }
+        for (int y = 0; y < height; ++y) {
+            out[static_cast<size_t>(y) * width + x] = (acc > 0) ? 1 : 0;
+            const int leave = y - radius;
+            const int enter = y + radius + 1;
+            if (leave >= 0 && horiz[static_cast<size_t>(leave) * width + x]) acc--;
+            if (enter < height && horiz[static_cast<size_t>(enter) * width + x]) acc++;
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t> build_reference_mask(
+    const Options& opt,
+    const RasterMeta& meta,
+    ReferencePinResult& ref_info
+) {
+    const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
+    std::vector<uint8_t> mask(npix, 0);
+
+    if (!opt.ref_region_path.empty()) {
+        ref_info.configured = true;
+        ref_info.mode = "vector_region";
+        return load_mask_any(opt.ref_region_path, meta);
+    }
+
+    if (opt.has_ref_lonlat) {
+        ref_info.configured = true;
+        ref_info.mode = "lonlat_disk";
+        ref_info.lon = opt.ref_lon;
+        ref_info.lat = opt.ref_lat;
+        ref_info.radius_m = opt.ref_radius_m;
+
+        if (meta.wkt.empty()) {
+            throw std::runtime_error("Raster has empty CRS WKT; cannot project --ref-lonlat");
+        }
+        OGRSpatialReference wgs84, dst_srs;
+        wgs84.SetWellKnownGeogCS("WGS84");
+        wgs84.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        if (dst_srs.importFromWkt(meta.wkt.c_str()) != OGRERR_NONE) {
+            throw std::runtime_error("Invalid raster CRS WKT for --ref-lonlat");
+        }
+        dst_srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+        UniqueOgrCt ct(OGRCreateCoordinateTransformation(&wgs84, &dst_srs));
+        if (!ct) {
+            throw std::runtime_error("Failed creating WGS84->raster transform for --ref-lonlat");
+        }
+        double mx = opt.ref_lon;
+        double my = opt.ref_lat;
+        if (!ct->Transform(1, &mx, &my)) {
+            throw std::runtime_error("Failed transforming --ref-lonlat coordinates to raster CRS");
+        }
+        const double* gt = meta.geotransform;
+        const double det = gt[1] * gt[5] - gt[2] * gt[4];
+        if (std::abs(det) < 1e-18) {
+            throw std::runtime_error("Degenerate GeoTransform for --ref-lonlat");
+        }
+        const double cx = (gt[5] * (mx - gt[0]) - gt[2] * (my - gt[3])) / det;
+        const double cy = (-gt[4] * (mx - gt[0]) + gt[1] * (my - gt[3])) / det;
+        const double crs_radius = meters_to_crs_units(dst_srs, opt.ref_radius_m, opt.ref_lat);
+        const double pix_size = std::max(1e-12, 0.5 * (std::hypot(gt[1], gt[4]) + std::hypot(gt[2], gt[5])));
+        const double r_px = std::max(1.0, crs_radius / pix_size);
+
+        const int x0 = std::max(0, static_cast<int>(std::floor(cx - r_px)));
+        const int x1 = std::min(meta.width - 1, static_cast<int>(std::ceil(cx + r_px)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(cy - r_px)));
+        const int y1 = std::min(meta.height - 1, static_cast<int>(std::ceil(cy + r_px)));
+        const double r2 = r_px * r_px;
+        for (int y = y0; y <= y1; ++y) {
+            const double dy = (y + 0.5) - cy;
+            for (int x = x0; x <= x1; ++x) {
+                const double dx = (x + 0.5) - cx;
+                if (dx * dx + dy * dy <= r2) {
+                    mask[static_cast<size_t>(y) * meta.width + x] = 1;
+                }
+            }
+        }
+        return mask;
+    }
+
+    if (opt.has_ref_px) {
+        ref_info.configured = true;
+        ref_info.mode = "pixel_disk";
+        const double cx = static_cast<double>(opt.ref_px) + 0.5;
+        const double cy = static_cast<double>(opt.ref_py) + 0.5;
+        const double r_px = static_cast<double>(std::max(1, opt.ref_radius_px));
+        const int x0 = std::max(0, static_cast<int>(std::floor(cx - r_px)));
+        const int x1 = std::min(meta.width - 1, static_cast<int>(std::ceil(cx + r_px)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(cy - r_px)));
+        const int y1 = std::min(meta.height - 1, static_cast<int>(std::ceil(cy + r_px)));
+        const double r2 = r_px * r_px;
+        for (int y = y0; y <= y1; ++y) {
+            const double dy = (y + 0.5) - cy;
+            for (int x = x0; x <= x1; ++x) {
+                const double dx = (x + 0.5) - cx;
+                if (dx * dx + dy * dy <= r2) {
+                    mask[static_cast<size_t>(y) * meta.width + x] = 1;
+                }
+            }
+        }
+        return mask;
+    }
+
+    return mask;
+}
+
+void apply_reference_pinning(
+    std::vector<float>& disp,
+    const std::vector<float>& coh,
+    const std::vector<uint8_t>& ref_mask,
+    float min_coh,
+    ReferencePinResult& ref_info
+) {
+    if (!ref_info.configured) {
+        return;
+    }
+    const size_t npix = disp.size();
+    std::vector<float> samples;
+    samples.reserve(4096);
+
+    for (size_t i = 0; i < npix; ++i) {
+        if (ref_mask[i] && std::isfinite(disp[i]) && std::isfinite(coh[i]) && coh[i] >= min_coh) {
+            samples.push_back(disp[i]);
+        }
+    }
+    if (samples.size() < 5) {
+        samples.clear();
+        for (size_t i = 0; i < npix; ++i) {
+            if (ref_mask[i] && std::isfinite(disp[i]) && std::isfinite(coh[i]) && coh[i] >= 0.25f) {
+                samples.push_back(disp[i]);
+            }
+        }
+    }
+    if (samples.empty()) {
+        for (size_t i = 0; i < npix; ++i) {
+            if (ref_mask[i] && std::isfinite(disp[i])) {
+                samples.push_back(disp[i]);
+            }
+        }
+    }
+    if (samples.empty()) {
+        std::cerr << "Warning: Configured reference region has 0 valid pixels on this pair; skipping pin.\n";
+        ref_info.applied = false;
+        ref_info.ref_pixels_used = 0;
+        return;
+    }
+
+    const size_t mid = samples.size() / 2;
+    std::nth_element(samples.begin(), samples.begin() + mid, samples.end());
+    const double offset = static_cast<double>(samples[mid]);
+    ref_info.offset_mm = offset;
+    ref_info.ref_pixels_used = samples.size();
+    ref_info.applied = true;
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < npix; ++i) {
+        if (std::isfinite(disp[i])) {
+            disp[i] = static_cast<float>(static_cast<double>(disp[i]) - offset);
+        }
+    }
+}
+
+ClosureResult evaluate_triplet_closure(
+    const Options& opt,
+    const RasterMeta& meta,
+    const std::vector<float>& disp,
+    const std::vector<float>& coh,
+    const std::vector<uint8_t>& ref_mask,
+    std::vector<uint8_t>& bad_mask_out,
+    std::vector<float>& residual_map_out
+) {
+    ClosureResult res;
+    res.thresh_mm = opt.closure_thresh_mm;
+    res.max_bad_frac = opt.closure_max_bad_frac;
+    res.mode = opt.closure_mode;
+
+    const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
+    bad_mask_out.assign(npix, 0);
+    residual_map_out.assign(npix, kNanF);
+
+    if (opt.closure_triplets.empty()) {
+        return res;
+    }
+
+    std::vector<uint16_t> eval_cnt(npix, 0);
+    std::vector<uint16_t> fail_cnt(npix, 0);
+    std::vector<double> sum_sq_res(npix, 0.0);
+    std::vector<float> tmp_r(npix, kNanF);
+    const bool has_ref = std::any_of(ref_mask.begin(), ref_mask.end(), [](uint8_t v) { return v != 0; });
+
+    for (const auto& trip : opt.closure_triplets) {
+        RasterMeta meta_a, meta_b;
+        std::vector<float> da = read_single_band_f32(trip.disp_a_path, meta_a);
+        std::vector<float> db = read_single_band_f32(trip.disp_b_path, meta_b);
+        assert_compatible_grid(meta, meta_a, "closure triplet A");
+        assert_compatible_grid(meta, meta_b, "closure triplet B");
+
+        const bool is_add_sub = (trip.mode == "add_sub");
+        std::fill(tmp_r.begin(), tmp_r.end(), kNanF);
+
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < npix; ++i) {
+            if (std::isfinite(disp[i]) && std::isfinite(da[i]) && std::isfinite(db[i])) {
+                tmp_r[i] = is_add_sub ? (disp[i] + da[i] - db[i]) : (da[i] + db[i] - disp[i]);
+            }
+        }
+
+        // Remove constant datum offset per triplet using coherent reference (or scene) median
+        std::vector<float> offset_samples;
+        offset_samples.reserve(npix / 8);
+        if (has_ref) {
+            for (size_t i = 0; i < npix; ++i) {
+                if (ref_mask[i] && std::isfinite(tmp_r[i]) && std::isfinite(coh[i]) && coh[i] >= opt.min_coh) {
+                    offset_samples.push_back(tmp_r[i]);
+                }
+            }
+        }
+        if (offset_samples.size() < 10) {
+            offset_samples.clear();
+            const size_t step = std::max<size_t>(1, npix / 250000);
+            for (size_t i = 0; i < npix; i += step) {
+                if (std::isfinite(tmp_r[i]) && std::isfinite(coh[i]) && coh[i] >= opt.min_coh) {
+                    offset_samples.push_back(tmp_r[i]);
+                }
+            }
+        }
+        double median_offset = 0.0;
+        if (!offset_samples.empty()) {
+            const size_t mid = offset_samples.size() / 2;
+            std::nth_element(offset_samples.begin(), offset_samples.begin() + mid, offset_samples.end());
+            median_offset = static_cast<double>(offset_samples[mid]);
+        }
+
+        res.triplets_evaluated++;
+        const double thresh = static_cast<double>(opt.closure_thresh_mm);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < npix; ++i) {
+            if (!std::isfinite(tmp_r[i])) continue;
+            const double rc = static_cast<double>(tmp_r[i]) - median_offset;
+            eval_cnt[i]++;
+            sum_sq_res[i] += rc * rc;
+            if (std::abs(rc) > thresh) {
+                fail_cnt[i]++;
+            }
+        }
+    }
+
+    const bool strict_mode = (opt.closure_mode == "strict");
+    size_t eval_coh_cnt = 0;
+    size_t bad_coh_cnt = 0;
+    size_t masked_total = 0;
+    double total_sq = 0.0;
+
+    #pragma omp parallel for reduction(+:eval_coh_cnt, bad_coh_cnt, masked_total, total_sq) schedule(static)
+    for (size_t i = 0; i < npix; ++i) {
+        if (eval_cnt[i] == 0) continue;
+        const double rms_pix = std::sqrt(sum_sq_res[i] / static_cast<double>(eval_cnt[i]));
+        residual_map_out[i] = static_cast<float>(rms_pix);
+        const bool is_bad = strict_mode
+            ? (fail_cnt[i] > 0)
+            : (static_cast<int>(fail_cnt[i]) * 2 > static_cast<int>(eval_cnt[i]));
+        if (is_bad) {
+            bad_mask_out[i] = 1;
+            masked_total++;
+        }
+        if (std::isfinite(coh[i]) && coh[i] >= opt.min_coh) {
+            eval_coh_cnt++;
+            total_sq += rms_pix * rms_pix;
+            if (is_bad) {
+                bad_coh_cnt++;
+            }
+        }
+    }
+
+    res.evaluated_coherent_pixels = eval_coh_cnt;
+    res.masked_pixels = masked_total;
+    if (eval_coh_cnt > 0) {
+        res.bad_fraction = static_cast<double>(bad_coh_cnt) / static_cast<double>(eval_coh_cnt);
+        res.rms_mm = std::sqrt(total_sq / static_cast<double>(eval_coh_cnt));
+        res.pair_rejected = (res.bad_fraction > static_cast<double>(opt.closure_max_bad_frac));
+    }
+    return res;
 }
 
 bool solve_linear_system(int n, std::vector<double>& mat, std::vector<double>& rhs) {
@@ -560,175 +1290,543 @@ bool solve_linear_system(int n, std::vector<double>& mat, std::vector<double>& r
     return true;
 }
 
-double eval_ramp_basis(int order, double u, double v, const std::vector<double>& c) {
-    if (order == 0) {
-        return c[0];
-    }
-    if (order == 1) {
-        return c[0] + c[1] * u + c[2] * v;
-    }
-    return c[0] + c[1] * u + c[2] * v + c[3] * u * u + c[4] * u * v + c[5] * v * v;
+int ramp_poly_param_count(int order) {
+    if (order < 0) return 0;
+    if (order == 0) return 1;
+    if (order == 1) return 3;
+    return 6;
 }
 
-RampResult remove_robust_ramp(
+double eval_surface_basis(
+    int order,
+    bool use_dem,
+    double u,
+    double v,
+    double z_km,
+    const std::vector<double>& c
+) {
+    double val = 0.0;
+    int idx = 0;
+    if (order < 0) {
+        if (use_dem) {
+            val += c[0] + c[1] * z_km;
+        }
+        return val;
+    }
+    val += c[idx++];
+    if (order >= 1) {
+        val += c[idx++] * u;
+        val += c[idx++] * v;
+    }
+    if (order == 2) {
+        val += c[idx++] * u * u;
+        val += c[idx++] * u * v;
+        val += c[idx++] * v * v;
+    }
+    if (use_dem) {
+        val += c[idx] * z_km;
+    }
+    return val;
+}
+
+double compute_pearson_corr(const std::vector<double>& x, const std::vector<double>& y) {
+    if (x.size() < 3 || x.size() != y.size()) {
+        return kNanD;
+    }
+    double sx = 0.0, sy = 0.0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        sx += x[i];
+        sy += y[i];
+    }
+    const double mx = sx / static_cast<double>(x.size());
+    const double my = sy / static_cast<double>(y.size());
+    double sxx = 0.0, syy = 0.0, sxy = 0.0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        const double dx = x[i] - mx;
+        const double dy = y[i] - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    const double denom = std::sqrt(sxx * syy);
+    return (denom > 1e-12) ? (sxy / denom) : kNanD;
+}
+
+std::vector<uint8_t> build_deform_exclusion_mask(
+    const Options& opt,
+    const RasterMeta& meta,
+    const StackMetadata& smeta,
+    const std::vector<double>& state_bands,
+    const std::vector<uint8_t>& ref_mask,
+    const std::vector<uint8_t>& ref_cc,
+    const std::vector<float>& disp,
+    const std::vector<float>& coh
+) {
+    const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
+    std::vector<uint8_t> excl(npix, 0);
+
+    if (!opt.deform_mask_path.empty()) {
+        excl = load_mask_any(opt.deform_mask_path, meta);
+    }
+
+    if (opt.ramp_deform_vel_mm_yr > 0.0f) {
+        std::vector<double> abs_v_map(npix, kNanD);
+        bool have_vel = false;
+        if (!opt.prior_vel_path.empty()) {
+            std::vector<float> pvel = read_raster_aligned_f32(opt.prior_vel_path, meta, GRA_Bilinear);
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < npix; ++i) {
+                if (std::isfinite(pvel[i])) {
+                    abs_v_map[i] = std::abs(static_cast<double>(pvel[i]));
+                }
+            }
+            have_vel = true;
+        } else if (smeta.pair_count >= 2 && !state_bands.empty()) {
+            const double* s11 = state_bands.data() + static_cast<size_t>(kBandS11) * npix;
+            const double* b1 = state_bands.data() + static_cast<size_t>(kBandB1) * npix;
+            const double* valid_cnt = state_bands.data() + static_cast<size_t>(kBandValidCount) * npix;
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < npix; ++i) {
+                if (valid_cnt[i] >= 2.0 && s11[i] > 1e-16) {
+                    const double v = b1[i] / s11[i];
+                    if (std::isfinite(v)) {
+                        abs_v_map[i] = std::abs(v);
+                    }
+                }
+            }
+            have_vel = true;
+        }
+
+        if (have_vel) {
+            const bool use_cc = !ref_cc.empty();
+            std::vector<double> v_samples;
+            v_samples.reserve(npix / 4);
+            for (size_t i = 0; i < npix; ++i) {
+                if (std::isfinite(abs_v_map[i]) && std::isfinite(disp[i]) &&
+                    std::isfinite(coh[i]) && coh[i] >= opt.min_coh && (!use_cc || ref_cc[i])) {
+                    v_samples.push_back(abs_v_map[i]);
+                }
+            }
+            double eff_thresh = static_cast<double>(opt.ramp_deform_vel_mm_yr);
+            // Adaptively cap velocity auto-masking at the top 45% fastest-deforming pixels so
+            // noisy or broadly deforming scenes never fall back to 0% masked!
+            if (v_samples.size() >= 64) {
+                const size_t q55 = static_cast<size_t>(0.55 * static_cast<double>(v_samples.size() - 1));
+                std::nth_element(v_samples.begin(), v_samples.begin() + q55, v_samples.end());
+                eff_thresh = std::max(eff_thresh, v_samples[q55]);
+            }
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < npix; ++i) {
+                if (std::isfinite(abs_v_map[i]) && abs_v_map[i] >= eff_thresh) {
+                    excl[i] = 1;
+                }
+            }
+        }
+    }
+
+    if (opt.ramp_mask_dilate_px > 0) {
+        bool any_excl = std::any_of(excl.begin(), excl.end(), [](uint8_t v) { return v != 0; });
+        if (any_excl) {
+            excl = dilate_mask_box(excl, meta.width, meta.height, opt.ramp_mask_dilate_px);
+        }
+    }
+
+    // Never exclude explicitly configured stable reference pixels
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < npix; ++i) {
+        if (ref_mask[i]) {
+            excl[i] = 0;
+        }
+    }
+    return excl;
+}
+
+std::vector<uint8_t> extract_reference_connected_component(
+    int width,
+    int height,
+    const std::vector<float>& disp,
+    const std::vector<float>& coh,
+    const std::vector<uint8_t>& ref_mask,
+    float min_coh
+) {
+    const size_t npix = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const bool has_ref = std::any_of(ref_mask.begin(), ref_mask.end(), [](uint8_t v) { return v != 0; });
+    if (!has_ref) {
+        return {};
+    }
+
+    auto run_bfs = [&](float coh_thr) -> std::pair<std::vector<uint8_t>, size_t> {
+        std::vector<uint8_t> visited(npix, 0);
+        std::vector<size_t> queue;
+        queue.reserve(npix / 4);
+        for (size_t i = 0; i < npix; ++i) {
+            if (ref_mask[i] && std::isfinite(disp[i]) && std::isfinite(coh[i]) && coh[i] >= coh_thr) {
+                visited[i] = 1;
+                queue.push_back(i);
+            }
+        }
+        size_t head = 0;
+        while (head < queue.size()) {
+            const size_t cur = queue[head++];
+            const int y = static_cast<int>(cur / static_cast<size_t>(width));
+            const int x = static_cast<int>(cur % static_cast<size_t>(width));
+            auto try_push = [&](int nx, int ny) {
+                const size_t ni = static_cast<size_t>(ny) * width + nx;
+                if (!visited[ni] && std::isfinite(disp[ni]) && std::isfinite(coh[ni]) && coh[ni] >= coh_thr) {
+                    visited[ni] = 1;
+                    queue.push_back(ni);
+                }
+            };
+            if (x > 0) try_push(x - 1, y);
+            if (x + 1 < width) try_push(x + 1, y);
+            if (y > 0) try_push(x, y - 1);
+            if (y + 1 < height) try_push(x, y + 1);
+        }
+        return {std::move(visited), queue.size()};
+    };
+
+    // First try strict bridge threshold (max(min_coh, 0.45)) so decorrelated mountain/water barriers
+    // cannot leak disconnected integer-fringe islands into the ramp/DEM regression.
+    const float strict_thr = std::max(min_coh, 0.45f);
+    auto [cc, count] = run_bfs(strict_thr);
+    if (count >= 256) {
+        return cc;
+    }
+    if (strict_thr > min_coh + 1e-6f) {
+        auto [cc2, count2] = run_bfs(min_coh);
+        if (count2 >= 64) {
+            return cc2;
+        }
+    }
+    return {};
+}
+
+RampResult remove_robust_ramp_and_dem(
     int width,
     int height,
     std::vector<float>& disp,
     const std::vector<float>& coh,
+    const std::vector<float>& dem,
+    const std::vector<uint8_t>& deform_excl_in,
+    const std::vector<uint8_t>& ref_mask,
+    const std::vector<uint8_t>& ref_cc,
     int order,
-    float min_coh
+    float min_coh,
+    float ramp_mask_sigma,
+    int ramp_mask_dilate_px
 ) {
     RampResult res;
     res.order = order;
-    if (order < 0) {
+    const bool have_dem = (dem.size() == disp.size());
+    if (order < 0 && !have_dem) {
         return res;
     }
-    const int n_params = (order == 0) ? 1 : (order == 1 ? 3 : 6);
-    const size_t npix = static_cast<size_t>(width) * static_cast<size_t>(height);
 
-    std::vector<size_t> valid_idx;
-    valid_idx.reserve(npix / 2);
+    const size_t npix = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const bool use_cc = !ref_cc.empty();
+
+    std::vector<size_t> all_coh_idx;
+    all_coh_idx.reserve(npix / 2);
+    std::vector<size_t> unmasked_idx;
+    unmasked_idx.reserve(npix / 2);
+
     double sum_sq_before = 0.0;
+    size_t excluded_prior_cnt = 0;
     for (size_t i = 0; i < npix; ++i) {
         if (std::isfinite(disp[i]) && std::isfinite(coh[i]) && coh[i] >= min_coh) {
-            valid_idx.push_back(i);
+            if (use_cc && !ref_cc[i]) {
+                continue;
+            }
+            all_coh_idx.push_back(i);
             sum_sq_before += static_cast<double>(disp[i]) * static_cast<double>(disp[i]);
+            if (deform_excl_in[i]) {
+                excluded_prior_cnt++;
+            } else {
+                unmasked_idx.push_back(i);
+            }
         }
     }
-    if (valid_idx.size() < static_cast<size_t>(std::max(12, n_params * 4))) {
+
+    if (all_coh_idx.size() < 16) {
         return res;
     }
-    res.rms_before_mm = std::sqrt(sum_sq_before / static_cast<double>(valid_idx.size()));
+    res.rms_before_mm = std::sqrt(sum_sq_before / static_cast<double>(all_coh_idx.size()));
+
+    // Guard against over-masking
+    std::vector<size_t> fit_idx = unmasked_idx;
+    if (fit_idx.size() < std::max<size_t>(30, all_coh_idx.size() / 10)) {
+        fit_idx = all_coh_idx;
+        excluded_prior_cnt = 0;
+    }
+
+    // Check DEM coverage & topographic relief over fit_idx
+    bool use_dem = false;
+    double dem_mean = 0.0;
+    double dem_std = 0.0;
+    if (have_dem) {
+        size_t dem_valid = 0;
+        double sum_z = 0.0;
+        double sum_z2 = 0.0;
+        for (size_t idx : fit_idx) {
+            if (std::isfinite(dem[idx])) {
+                const double z = static_cast<double>(dem[idx]);
+                sum_z += z;
+                sum_z2 += z * z;
+                dem_valid++;
+            }
+        }
+        if (dem_valid >= std::max<size_t>(30, fit_idx.size() / 2)) {
+            dem_mean = sum_z / static_cast<double>(dem_valid);
+            const double var = std::max(0.0, sum_z2 / static_cast<double>(dem_valid) - dem_mean * dem_mean);
+            dem_std = std::sqrt(var);
+            res.dem_mean_m = dem_mean;
+            res.dem_std_m = dem_std;
+            if (dem_std >= 5.0) {
+                use_dem = true;
+                std::vector<size_t> dem_fit_idx;
+                dem_fit_idx.reserve(dem_valid);
+                for (size_t idx : fit_idx) {
+                    if (std::isfinite(dem[idx])) {
+                        dem_fit_idx.push_back(idx);
+                    }
+                }
+                fit_idx = std::move(dem_fit_idx);
+            }
+        }
+    }
+
+    if (order < 0 && !use_dem) {
+        return res;
+    }
+
+    const int poly_params = (order < 0) ? 1 : ramp_poly_param_count(order);
+    const int n_params = poly_params + (use_dem ? 1 : 0);
+    if (fit_idx.size() < static_cast<size_t>(std::max(12, n_params * 4))) {
+        return res;
+    }
 
     const double inv_half_w = (width > 1) ? 2.0 / static_cast<double>(width - 1) : 0.0;
     const double inv_half_h = (height > 1) ? 2.0 / static_cast<double>(height - 1) : 0.0;
 
+    // Helper to run IRLS passes on an index subset
+    auto run_irls = [&](const std::vector<size_t>& indices, std::vector<double>& coeffs, double& mad_sigma, int iter_start, int iter_end) -> bool {
+        const size_t n_ind = indices.size();
+        const size_t sample_step = std::max<size_t>(1, n_ind / 200000);
+        std::vector<double> abs_res_sample;
+        abs_res_sample.reserve((n_ind + sample_step - 1) / sample_step);
+
+        for (int iter = iter_start; iter < iter_end; ++iter) {
+            std::vector<double> ata(static_cast<size_t>(n_params) * n_params, 0.0);
+            std::vector<double> aty(n_params, 0.0);
+            const double huber_delta = 1.345 * mad_sigma;
+            const double tukey_c = 4.685 * mad_sigma;
+
+            #pragma omp parallel
+            {
+                std::vector<double> local_ata(static_cast<size_t>(n_params) * n_params, 0.0);
+                std::vector<double> local_aty(n_params, 0.0);
+                double phi[8] = {0.0};
+
+                #pragma omp for schedule(static)
+                for (size_t k = 0; k < n_ind; ++k) {
+                    const size_t idx = indices[k];
+                    const int y = static_cast<int>(idx / static_cast<size_t>(width));
+                    const int x = static_cast<int>(idx % static_cast<size_t>(width));
+                    const double u = static_cast<double>(x) * inv_half_w - 1.0;
+                    const double v = static_cast<double>(y) * inv_half_h - 1.0;
+                    const double z_km = use_dem ? (static_cast<double>(dem[idx]) - dem_mean) / 1000.0 : 0.0;
+
+                    const double g = static_cast<double>(coh[idx]);
+                    double w = g * g * g;
+                    const double val = static_cast<double>(disp[idx]);
+                    if (iter > 0) {
+                        const double r = std::abs(val - eval_surface_basis(order, use_dem, u, v, z_km, coeffs));
+                        if (iter <= 2) {
+                            if (r > huber_delta) {
+                                w *= (huber_delta / r);
+                            }
+                        } else {
+                            if (r >= tukey_c) {
+                                continue;
+                            }
+                            const double t = r / tukey_c;
+                            const double s = 1.0 - t * t;
+                            w *= s * s;
+                        }
+                    }
+
+                    int p = 0;
+                    phi[p++] = 1.0;
+                    if (order >= 1) {
+                        phi[p++] = u;
+                        phi[p++] = v;
+                    }
+                    if (order == 2) {
+                        phi[p++] = u * u;
+                        phi[p++] = u * v;
+                        phi[p++] = v * v;
+                    }
+                    if (use_dem) {
+                        phi[p++] = z_km;
+                    }
+                    for (int r = 0; r < n_params; ++r) {
+                        const double wr = w * phi[r];
+                        local_aty[r] += wr * val;
+                        for (int c = r; c < n_params; ++c) {
+                            local_ata[static_cast<size_t>(r) * n_params + c] += wr * phi[c];
+                        }
+                    }
+                }
+
+                #pragma omp critical
+                {
+                    for (int r = 0; r < n_params; ++r) {
+                        aty[r] += local_aty[r];
+                        for (int c = r; c < n_params; ++c) {
+                            ata[static_cast<size_t>(r) * n_params + c] +=
+                                local_ata[static_cast<size_t>(r) * n_params + c];
+                        }
+                    }
+                }
+            }
+
+            for (int r = 0; r < n_params; ++r) {
+                ata[static_cast<size_t>(r) * n_params + r] += 1e-10;
+                for (int c = 0; c < r; ++c) {
+                    ata[static_cast<size_t>(r) * n_params + c] =
+                        ata[static_cast<size_t>(c) * n_params + r];
+                }
+            }
+            // Mild physical ridge damping on DEM tropospheric slope so low-relief basins cannot
+            // produce unphysical +/-150 mm/km slopes while preserving unbiased slopes over real relief.
+            if (use_dem) {
+                const int dem_col = n_params - 1;
+                const double sum_w_eff = ata[0];
+                ata[static_cast<size_t>(dem_col) * n_params + dem_col] += sum_w_eff * 0.0025;
+            }
+            if (!solve_linear_system(n_params, ata, aty)) {
+                return (iter > 0);
+            }
+            coeffs = aty;
+
+            if (iter + 1 < iter_end) {
+                abs_res_sample.clear();
+                for (size_t k = 0; k < n_ind; k += sample_step) {
+                    const size_t idx = indices[k];
+                    const int y = static_cast<int>(idx / static_cast<size_t>(width));
+                    const int x = static_cast<int>(idx % static_cast<size_t>(width));
+                    const double u = static_cast<double>(x) * inv_half_w - 1.0;
+                    const double v = static_cast<double>(y) * inv_half_h - 1.0;
+                    const double z_km = use_dem ? (static_cast<double>(dem[idx]) - dem_mean) / 1000.0 : 0.0;
+                    const double pred = eval_surface_basis(order, use_dem, u, v, z_km, coeffs);
+                    abs_res_sample.push_back(std::abs(static_cast<double>(disp[idx]) - pred));
+                }
+                const size_t mid = abs_res_sample.size() / 2;
+                std::nth_element(abs_res_sample.begin(), abs_res_sample.begin() + mid, abs_res_sample.end());
+                mad_sigma = std::max(0.05, 1.4826 * abs_res_sample[mid]);
+            }
+        }
+        return true;
+    };
+
     std::vector<double> coeffs(n_params, 0.0);
     double mad_sigma = 1.0;
-    const size_t n_valid = valid_idx.size();
-    const size_t sample_step = std::max<size_t>(1, n_valid / 200000);
-    std::vector<double> abs_res_sample;
-    abs_res_sample.reserve((n_valid + sample_step - 1) / sample_step);
 
-    // 2 convex Huber IRLS passes followed by 4 redescending Tukey Biweight passes
-    // so localized subsidence bowls do not bias the regional background ramp.
-    for (int iter = 0; iter < 6; ++iter) {
-        std::vector<double> ata(static_cast<size_t>(n_params) * n_params, 0.0);
-        std::vector<double> aty(n_params, 0.0);
-        const double huber_delta = 1.345 * mad_sigma;
-        const double tukey_c = 4.685 * mad_sigma;
+    // Stage 1: Initial Huber IRLS fit on prior-unmasked pixels
+    if (!run_irls(fit_idx, coeffs, mad_sigma, 0, 2)) {
+        return res;
+    }
 
-        #pragma omp parallel
-        {
-            std::vector<double> local_ata(static_cast<size_t>(n_params) * n_params, 0.0);
-            std::vector<double> local_aty(n_params, 0.0);
-            double phi[6] = {1.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-
-            #pragma omp for schedule(static)
-            for (size_t k = 0; k < n_valid; ++k) {
-                size_t idx = valid_idx[k];
-                int y = static_cast<int>(idx / static_cast<size_t>(width));
-                int x = static_cast<int>(idx % static_cast<size_t>(width));
-                double u = static_cast<double>(x) * inv_half_w - 1.0;
-                double v = static_cast<double>(y) * inv_half_h - 1.0;
-
-                double g = static_cast<double>(coh[idx]);
-                double w = g * g * g;
-                double val = static_cast<double>(disp[idx]);
-                if (iter > 0) {
-                    double r = std::abs(val - eval_ramp_basis(order, u, v, coeffs));
-                    if (iter <= 2) {
-                        if (r > huber_delta) {
-                            w *= (huber_delta / r);
-                        }
-                    } else {
-                        if (r >= tukey_c) {
-                            continue;
-                        }
-                        double t = r / tukey_c;
-                        double s = 1.0 - t * t;
-                        w *= s * s;
-                    }
-                }
-                phi[0] = 1.0;
-                if (order >= 1) {
-                    phi[1] = u;
-                    phi[2] = v;
-                }
-                if (order == 2) {
-                    phi[3] = u * u;
-                    phi[4] = u * v;
-                    phi[5] = v * v;
-                }
-                for (int r = 0; r < n_params; ++r) {
-                    double wr = w * phi[r];
-                    local_aty[r] += wr * val;
-                    for (int c = r; c < n_params; ++c) {
-                        local_ata[static_cast<size_t>(r) * n_params + c] += wr * phi[c];
-                    }
-                }
-            }
-
-            #pragma omp critical
-            {
-                for (int r = 0; r < n_params; ++r) {
-                    aty[r] += local_aty[r];
-                    for (int c = r; c < n_params; ++c) {
-                        ata[static_cast<size_t>(r) * n_params + c] +=
-                            local_ata[static_cast<size_t>(r) * n_params + c];
-                    }
-                }
+    // Stage 2: Explicit single-pair residual masking of localized high-deformation bowls + dilation
+    std::vector<size_t> stable_idx = fit_idx;
+    size_t resid_masked_cnt = 0;
+    if (ramp_mask_sigma > 0.0f) {
+        const double resid_thresh = static_cast<double>(ramp_mask_sigma) * mad_sigma;
+        std::vector<uint8_t> anom_mask(npix, 0);
+        #pragma omp parallel for schedule(static)
+        for (size_t k = 0; k < fit_idx.size(); ++k) {
+            const size_t idx = fit_idx[k];
+            if (ref_mask[idx]) continue;
+            const int y = static_cast<int>(idx / static_cast<size_t>(width));
+            const int x = static_cast<int>(idx % static_cast<size_t>(width));
+            const double u = static_cast<double>(x) * inv_half_w - 1.0;
+            const double v = static_cast<double>(y) * inv_half_h - 1.0;
+            const double z_km = use_dem ? (static_cast<double>(dem[idx]) - dem_mean) / 1000.0 : 0.0;
+            const double r = std::abs(static_cast<double>(disp[idx]) - eval_surface_basis(order, use_dem, u, v, z_km, coeffs));
+            if (r > resid_thresh) {
+                anom_mask[idx] = 1;
             }
         }
-        for (int r = 0; r < n_params; ++r) {
-            ata[static_cast<size_t>(r) * n_params + r] += 1e-10;
-            for (int c = 0; c < r; ++c) {
-                ata[static_cast<size_t>(r) * n_params + c] =
-                    ata[static_cast<size_t>(c) * n_params + r];
+        if (ramp_mask_dilate_px > 0) {
+            anom_mask = dilate_mask_box(anom_mask, width, height, std::min(2, ramp_mask_dilate_px));
+        }
+        std::vector<size_t> filtered;
+        filtered.reserve(fit_idx.size());
+        for (size_t idx : fit_idx) {
+            if (!anom_mask[idx] || ref_mask[idx]) {
+                filtered.push_back(idx);
+            } else {
+                resid_masked_cnt++;
             }
         }
-        if (!solve_linear_system(n_params, ata, aty)) {
-            if (iter == 0) {
-                return res;
-            }
-            break;
+        if (filtered.size() >= std::max<size_t>(30, fit_idx.size() / 5)) {
+            stable_idx = std::move(filtered);
+        } else {
+            resid_masked_cnt = 0;
         }
-        coeffs = aty;
+    }
 
-        if (iter < 5) {
-            abs_res_sample.clear();
-            for (size_t k = 0; k < n_valid; k += sample_step) {
-                size_t idx = valid_idx[k];
-                int y = static_cast<int>(idx / static_cast<size_t>(width));
-                int x = static_cast<int>(idx % static_cast<size_t>(width));
-                double u = static_cast<double>(x) * inv_half_w - 1.0;
-                double v = static_cast<double>(y) * inv_half_h - 1.0;
-                double pred = eval_ramp_basis(order, u, v, coeffs);
-                abs_res_sample.push_back(std::abs(static_cast<double>(disp[idx]) - pred));
-            }
-            size_t mid = abs_res_sample.size() / 2;
-            std::nth_element(abs_res_sample.begin(), abs_res_sample.begin() + mid, abs_res_sample.end());
-            mad_sigma = std::max(0.05, 1.4826 * abs_res_sample[mid]);
+    // Stage 3: Final Tukey biweight IRLS refinement strictly on stable background pixels
+    run_irls(stable_idx, coeffs, mad_sigma, 2, 6);
+
+    // Pre-correction DEM correlation diagnostic on stable pixels
+    if (use_dem) {
+        const size_t step = std::max<size_t>(1, stable_idx.size() / 100000);
+        std::vector<double> zs, d_before, d_after;
+        zs.reserve(stable_idx.size() / step + 1);
+        d_before.reserve(zs.capacity());
+        d_after.reserve(zs.capacity());
+        for (size_t k = 0; k < stable_idx.size(); k += step) {
+            const size_t idx = stable_idx[k];
+            const int y = static_cast<int>(idx / static_cast<size_t>(width));
+            const int x = static_cast<int>(idx % static_cast<size_t>(width));
+            const double u = static_cast<double>(x) * inv_half_w - 1.0;
+            const double v = static_cast<double>(y) * inv_half_h - 1.0;
+            const double z_km = (static_cast<double>(dem[idx]) - dem_mean) / 1000.0;
+            const double val = static_cast<double>(disp[idx]);
+            zs.push_back(z_km);
+            d_before.push_back(val);
+            d_after.push_back(val - eval_surface_basis(order, true, u, v, z_km, coeffs));
         }
+        res.dem_corr_before = compute_pearson_corr(zs, d_before);
+        res.dem_corr_after = compute_pearson_corr(zs, d_after);
+        res.dem_applied = true;
+        res.dem_slope_mm_per_km = coeffs.back();
     }
 
     double sum_sq_after = 0.0;
     #pragma omp parallel for reduction(+:sum_sq_after) schedule(static)
     for (size_t idx = 0; idx < npix; ++idx) {
         if (!std::isfinite(disp[idx])) continue;
-        int y = static_cast<int>(idx / static_cast<size_t>(width));
-        int x = static_cast<int>(idx % static_cast<size_t>(width));
-        double u = static_cast<double>(x) * inv_half_w - 1.0;
-        double v = static_cast<double>(y) * inv_half_h - 1.0;
-        double corrected = static_cast<double>(disp[idx]) - eval_ramp_basis(order, u, v, coeffs);
+        const int y = static_cast<int>(idx / static_cast<size_t>(width));
+        const int x = static_cast<int>(idx % static_cast<size_t>(width));
+        const double u = static_cast<double>(x) * inv_half_w - 1.0;
+        const double v = static_cast<double>(y) * inv_half_h - 1.0;
+        const bool pix_has_dem = use_dem && std::isfinite(dem[idx]);
+        const double z_km = pix_has_dem ? (static_cast<double>(dem[idx]) - dem_mean) / 1000.0 : 0.0;
+        const double pred = eval_surface_basis(order, pix_has_dem, u, v, z_km, coeffs);
+        const double corrected = static_cast<double>(disp[idx]) - pred;
         disp[idx] = static_cast<float>(corrected);
-        if (std::isfinite(coh[idx]) && coh[idx] >= min_coh) {
+        if (std::isfinite(coh[idx]) && coh[idx] >= min_coh && (!use_cc || ref_cc[idx])) {
             sum_sq_after += corrected * corrected;
         }
     }
+
     res.applied = true;
     res.coeffs = std::move(coeffs);
-    res.rms_after_mm = std::sqrt(sum_sq_after / static_cast<double>(n_valid));
+    res.rms_after_mm = std::sqrt(sum_sq_after / static_cast<double>(all_coh_idx.size()));
+    res.masked_deform_pixels = excluded_prior_cnt + resid_masked_cnt;
+    res.masked_deform_fraction = static_cast<double>(res.masked_deform_pixels) / static_cast<double>(all_coh_idx.size());
     return res;
 }
 
@@ -740,7 +1838,9 @@ void update_state_incremental(
     double t0_days,
     double t1_days,
     double origin_days,
-    float min_coh
+    float min_coh,
+    bool redundant_pair,
+    double weight_scale
 ) {
     const double tau_yr = (t1_days - t0_days) / kDaysPerYear;
     const double m_yr = (0.5 * (t0_days + t1_days) - origin_days) / kDaysPerYear;
@@ -766,21 +1866,25 @@ void update_state_incremental(
 
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < npix; ++i) {
-        latest[i] = kNanD;
-        double c = static_cast<double>(coh[i]);
-        double d = static_cast<double>(disp[i]);
+        if (!redundant_pair) {
+            latest[i] = kNanD;
+        }
+        const double c = static_cast<double>(coh[i]);
+        const double d = static_cast<double>(disp[i]);
         if (!std::isfinite(c)) {
             continue;
         }
+        const double g = std::clamp(c, 0.0, 1.0);
         if (std::isfinite(d)) {
-            fp_cnt[i] += 1.0;
-            sum_coh[i] += std::clamp(c, 0.0, 1.0);
+            if (!redundant_pair || fp_cnt[i] == 0.0) {
+                fp_cnt[i] += 1.0;
+                sum_coh[i] += g;
+            }
         }
         if (!std::isfinite(d) || c < static_cast<double>(min_coh)) {
             continue;
         }
-        double g = std::clamp(c, 0.0, 1.0);
-        double w = std::max(1e-4, g * g);
+        const double w = std::max(1e-4, g * g * weight_scale);
         sum_w[i] += w;
         s11[i] += w * x11;
         s12[i] += w * x12;
@@ -788,10 +1892,12 @@ void update_state_incremental(
         b1[i] += w * x1 * d;
         b2[i] += w * x2 * d;
         syy[i] += w * d * d;
-        cum_raw[i] += d;
-        valid_dt[i] += tau_yr;
         valid_cnt[i] += 1.0;
-        latest[i] = d;
+        if (!redundant_pair) {
+            cum_raw[i] += d;
+            valid_dt[i] += tau_yr;
+            latest[i] = d;
+        }
     }
 }
 
@@ -801,12 +1907,14 @@ struct DerivedFields {
     std::vector<float> cum_disp;
     std::vector<float> temp_coh;
     std::vector<float> unc;
+    std::vector<float> snr;
     std::vector<float> latest_disp;
     std::vector<double> vel_d;
     std::vector<double> accel_d;
     std::vector<double> cum_d;
     std::vector<double> coh_d;
     std::vector<double> unc_d;
+    std::vector<double> snr_d;
     std::vector<double> latest_d;
     std::vector<int> valid_cnt;
     size_t valid_stack_pixels = 0;
@@ -827,6 +1935,7 @@ DerivedFields derive_products(
     out.cum_disp.assign(npix, kNanF);
     out.temp_coh.assign(npix, kNanF);
     out.unc.assign(npix, kNanF);
+    out.snr.assign(npix, kNanF);
     out.latest_disp.assign(npix, kNanF);
 
     out.vel_d.assign(npix, kNanD);
@@ -834,10 +1943,12 @@ DerivedFields derive_products(
     out.cum_d.assign(npix, kNanD);
     out.coh_d.assign(npix, kNanD);
     out.unc_d.assign(npix, kNanD);
+    out.snr_d.assign(npix, kNanD);
     out.latest_d.assign(npix, kNanD);
     out.valid_cnt.assign(npix, 0);
 
-    const double total_span_yr = smeta.sum_dt_days / kDaysPerYear;
+    const double span_days = std::max(smeta.sum_dt_days, smeta.last_t1_days - smeta.first_t0_days);
+    const double total_span_yr = span_days / kDaysPerYear;
     const double* s11 = state.data() + static_cast<size_t>(kBandS11) * npix;
     const double* s12 = state.data() + static_cast<size_t>(kBandS12) * npix;
     const double* s22 = state.data() + static_cast<size_t>(kBandS22) * npix;
@@ -871,7 +1982,6 @@ DerivedFields derive_products(
         if (vc < 1 || s11[i] <= 1e-16 || tcoh < static_cast<double>(min_coh) * 0.5) {
             continue;
         }
-        // Require reasonable epoch coverage when multi-pass (>=2) so single erratic glint doesn't dominate
         if (smeta.pair_count >= 3 && vc < std::max(2, static_cast<int>(std::ceil(0.35 * smeta.pair_count)))) {
             continue;
         }
@@ -891,6 +2001,11 @@ DerivedFields derive_products(
             double se_v = std::sqrt(wssr / (static_cast<double>(vc - 1) * s11[i]));
             out.unc_d[i] = se_v;
             out.unc[i] = static_cast<float>(se_v);
+            double snr_val = (se_v > 1e-9)
+                ? (std::abs(v_lin) / se_v)
+                : ((std::abs(v_lin) > 1e-6) ? 1e6 : 0.0);
+            out.snr_d[i] = snr_val;
+            out.snr[i] = static_cast<float>(std::min(snr_val, 1e6));
         }
 
         if (vc >= 3 && s11[i] > 0.0 && s22[i] > 0.0) {
@@ -935,28 +2050,28 @@ std::string get_feature_str(OGRFeature* feat, const char* field, const std::stri
     return (val != nullptr && *val != '\0') ? std::string(val) : fallback;
 }
 
-double meters_to_crs_units(const OGRSpatialReference& srs, double buffer_m, double center_lat_deg) {
-    if (srs.IsProjected()) {
-        double lin = srs.GetLinearUnits(nullptr);
-        return (lin > 0.0) ? (buffer_m / lin) : buffer_m;
-    }
-    double cos_lat = std::max(0.2, std::cos(center_lat_deg * 3.14159265358979323846 / 180.0));
-    return buffer_m / (111320.0 * cos_lat);
-}
-
 std::string classify_corridor_risk(
     int valid_pixels,
     int alert_pixel_count,
     double mean_vel,
     double p95_abs_vel,
-    float vel_alert_mm_yr
+    float vel_alert_mm_yr,
+    bool stack_mature,
+    bool& maturity_gated_out
 ) {
+    maturity_gated_out = false;
     if (valid_pixels <= 0 || !std::isfinite(p95_abs_vel)) {
         return "no_coverage";
     }
-    if (alert_pixel_count > 0 &&
-        (p95_abs_vel >= 2.0 * vel_alert_mm_yr || alert_pixel_count >= 10 || std::abs(mean_vel) >= vel_alert_mm_yr)) {
-        return "critical";
+    const bool meets_critical =
+        alert_pixel_count > 0 &&
+        (p95_abs_vel >= 2.0 * vel_alert_mm_yr || alert_pixel_count >= 10 || std::abs(mean_vel) >= vel_alert_mm_yr);
+    if (meets_critical) {
+        if (stack_mature) {
+            return "critical";
+        }
+        maturity_gated_out = true;
+        return "warning";
     }
     if (alert_pixel_count > 0 || p95_abs_vel >= vel_alert_mm_yr) {
         return "warning";
@@ -972,9 +2087,12 @@ void process_corridors(
     const RasterMeta& meta,
     const StackMetadata& smeta,
     const DerivedFields& df,
+    bool stack_mature,
     std::vector<CorridorMetric>& metrics_out,
-    std::vector<AlertPoint>& alerts_out
+    std::vector<AlertPoint>& alerts_out,
+    size_t& total_snr_gated_out
 ) {
+    total_snr_gated_out = 0;
     const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
     if (opt.corridors_path.empty()) {
         return;
@@ -1024,7 +2142,10 @@ void process_corridors(
 
     std::vector<int32_t> owner_corridor(npix, -1);
     std::vector<double> owner_best_vel(npix, 0.0);
-    const int min_alert_passes = (smeta.pair_count >= 2) ? 2 : 1;
+    const int total_pairs_any = smeta.pair_count + smeta.redundant_pair_count;
+    const int min_alert_passes = (opt.min_alert_passes > 0)
+        ? opt.min_alert_passes
+        : ((total_pairs_any >= 2 || opt.min_alert_snr > 0.0f) ? 2 : 1);
 
     const int n_layers = vds->GetLayerCount();
     int feature_seq = 0;
@@ -1151,11 +2272,12 @@ void process_corridors(
 
             const int corridor_idx = static_cast<int>(metrics_out.size());
             std::vector<double> abs_vels;
-            double sum_vel = 0.0, sum_coh = 0.0, sum_cum = 0.0, sum_acc = 0.0, sum_lat = 0.0;
+            std::vector<double> snrs;
+            double sum_vel = 0.0, sum_coh = 0.0, sum_cum = 0.0, sum_acc = 0.0, sum_lat = 0.0, sum_snr = 0.0;
             double min_v = std::numeric_limits<double>::infinity();
             double max_v = -std::numeric_limits<double>::infinity();
             double max_abs_cum = 0.0, max_abs_acc = 0.0;
-            int acc_cnt = 0, lat_cnt = 0;
+            int acc_cnt = 0, lat_cnt = 0, snr_cnt = 0;
 
             for (int sy = 0; sy < ph; ++sy) {
                 const int gy = y0 + sy;
@@ -1166,10 +2288,10 @@ void process_corridors(
                     if (!std::isfinite(df.vel_d[gi])) continue;
 
                     cm.valid_pixels++;
-                    double v = df.vel_d[gi];
-                    double av = std::abs(v);
-                    double c = df.coh_d[gi];
-                    double cd = df.cum_d[gi];
+                    const double v = df.vel_d[gi];
+                    const double av = std::abs(v);
+                    const double c = df.coh_d[gi];
+                    const double cd = df.cum_d[gi];
                     abs_vels.push_back(av);
                     sum_vel += v;
                     sum_coh += c;
@@ -1178,6 +2300,13 @@ void process_corridors(
                     max_v = std::max(max_v, v);
                     max_abs_cum = std::max(max_abs_cum, std::abs(cd));
 
+                    const bool has_snr = std::isfinite(df.snr_d[gi]);
+                    if (has_snr) {
+                        const double s_capped = std::min(df.snr_d[gi], 1e4);
+                        snrs.push_back(s_capped);
+                        sum_snr += s_capped;
+                        snr_cnt++;
+                    }
                     if (std::isfinite(df.accel_d[gi])) {
                         sum_acc += df.accel_d[gi];
                         max_abs_acc = std::max(max_abs_acc, std::abs(df.accel_d[gi]));
@@ -1187,19 +2316,29 @@ void process_corridors(
                         sum_lat += df.latest_d[gi];
                         lat_cnt++;
                     }
-                    bool high_coh = (c >= static_cast<double>(opt.min_alert_coh));
+
+                    const bool high_coh = (c >= static_cast<double>(opt.min_alert_coh));
                     if (high_coh) {
                         cm.high_coh_pixels++;
                     }
-                    bool is_alert = high_coh && df.valid_cnt[gi] >= min_alert_passes &&
+                    const bool exceeds_motion =
                         (av >= static_cast<double>(opt.vel_alert_mm_yr) ||
                          (std::isfinite(df.accel_d[gi]) && std::abs(df.accel_d[gi]) >= static_cast<double>(opt.accel_alert_mm_yr2)));
-                    if (is_alert) {
-                        cm.alert_pixel_count++;
-                        double score = av;
-                        if (owner_corridor[gi] < 0 || score > owner_best_vel[gi]) {
-                            owner_corridor[gi] = corridor_idx;
-                            owner_best_vel[gi] = score;
+                    const bool passes_snr = (opt.min_alert_snr <= 0.0f)
+                        ? true
+                        : (has_snr && df.snr_d[gi] >= static_cast<double>(opt.min_alert_snr));
+
+                    if (high_coh && df.valid_cnt[gi] >= min_alert_passes && exceeds_motion) {
+                        if (!passes_snr) {
+                            cm.snr_gated_pixels++;
+                            total_snr_gated_out++;
+                        } else {
+                            cm.alert_pixel_count++;
+                            const double score = av;
+                            if (owner_corridor[gi] < 0 || score > owner_best_vel[gi]) {
+                                owner_corridor[gi] = corridor_idx;
+                                owner_best_vel[gi] = score;
+                            }
                         }
                     }
                 }
@@ -1218,6 +2357,12 @@ void process_corridors(
                 size_t p95 = static_cast<size_t>(std::floor(0.95 * static_cast<double>(abs_vels.size() - 1)));
                 std::nth_element(abs_vels.begin(), abs_vels.begin() + p95, abs_vels.end());
                 cm.p95_abs_velocity_mm_yr = abs_vels[p95];
+                if (snr_cnt > 0) {
+                    cm.mean_snr = sum_snr / static_cast<double>(snr_cnt);
+                    size_t p95s = static_cast<size_t>(std::floor(0.95 * static_cast<double>(snrs.size() - 1)));
+                    std::nth_element(snrs.begin(), snrs.begin() + p95s, snrs.end());
+                    cm.p95_snr = snrs[p95s];
+                }
                 if (acc_cnt > 0) {
                     cm.mean_acceleration_mm_yr2 = sum_acc / static_cast<double>(acc_cnt);
                     cm.max_abs_acceleration_mm_yr2 = max_abs_acc;
@@ -1228,12 +2373,11 @@ void process_corridors(
             }
             cm.risk_level = classify_corridor_risk(
                 cm.valid_pixels, cm.alert_pixel_count, cm.mean_velocity_mm_yr,
-                cm.p95_abs_velocity_mm_yr, opt.vel_alert_mm_yr);
+                cm.p95_abs_velocity_mm_yr, opt.vel_alert_mm_yr, stack_mature, cm.maturity_gated);
             metrics_out.push_back(std::move(cm));
         }
     }
 
-    // Collect candidate alert points strictly inside corridors, sorted & spatially NMS-clustered
     std::vector<AlertPoint> candidates;
     for (int py = 0; py < meta.height; ++py) {
         for (int px = 0; px < meta.width; ++px) {
@@ -1248,6 +2392,8 @@ void process_corridors(
             pt.cumulative_disp_mm = df.cum_d[gi];
             pt.temporal_coherence = df.coh_d[gi];
             pt.uncertainty_mm_yr = df.unc_d[gi];
+            pt.velocity_snr = df.snr_d[gi];
+            pt.severity = stack_mature ? "critical" : "provisional";
             pt.corridor_asset_id = metrics_out[cid].asset_id;
             pt.corridor_name = metrics_out[cid].name;
             pt.score = std::abs(pt.velocity_mm_yr) +
@@ -1290,7 +2436,12 @@ void write_corridor_outputs(
     const RasterMeta& meta,
     const StackMetadata& smeta,
     const RampResult& ramp,
+    const ReferencePinResult& ref_pin,
+    const ClosureResult& closure,
     const DerivedFields& df,
+    bool stack_mature,
+    double calendar_span_days,
+    size_t total_snr_gated,
     const std::vector<CorridorMetric>& metrics,
     const std::vector<AlertPoint>& alerts
 ) {
@@ -1307,16 +2458,20 @@ void write_corridor_outputs(
                 << "        \"asset_class\": \"" << json_escape(m.asset_class) << "\",\n"
                 << "        \"ref\": \"" << json_escape(m.source_ref) << "\",\n"
                 << "        \"risk_level\": \"" << m.risk_level << "\",\n"
+                << "        \"maturity_gated\": " << (m.maturity_gated ? "true" : "false") << ",\n"
                 << "        \"pixel_count\": " << m.pixel_count << ",\n"
                 << "        \"valid_pixels\": " << m.valid_pixels << ",\n"
                 << "        \"high_coh_pixels\": " << m.high_coh_pixels << ",\n"
                 << "        \"alert_pixel_count\": " << m.alert_pixel_count << ",\n"
+                << "        \"snr_gated_pixels\": " << m.snr_gated_pixels << ",\n"
                 << "        \"coverage_ratio\": " << json_num(m.coverage_ratio, 4) << ",\n"
                 << "        \"mean_coherence\": " << json_num(m.mean_coherence, 4) << ",\n"
                 << "        \"mean_velocity_mm_yr\": " << json_num(m.mean_velocity_mm_yr, 3) << ",\n"
                 << "        \"min_velocity_mm_yr\": " << json_num(m.min_velocity_mm_yr, 3) << ",\n"
                 << "        \"max_velocity_mm_yr\": " << json_num(m.max_velocity_mm_yr, 3) << ",\n"
                 << "        \"p95_abs_velocity_mm_yr\": " << json_num(m.p95_abs_velocity_mm_yr, 3) << ",\n"
+                << "        \"mean_snr\": " << json_num(m.mean_snr, 3) << ",\n"
+                << "        \"p95_snr\": " << json_num(m.p95_snr, 3) << ",\n"
                 << "        \"mean_cumulative_disp_mm\": " << json_num(m.mean_cumulative_disp_mm, 3) << ",\n"
                 << "        \"max_abs_cumulative_disp_mm\": " << json_num(m.max_abs_cumulative_disp_mm, 3) << ",\n"
                 << "        \"mean_acceleration_mm_yr2\": " << json_num(m.mean_acceleration_mm_yr2, 3) << ",\n"
@@ -1339,11 +2494,14 @@ void write_corridor_outputs(
                << "      \"properties\": {\n"
                << "        \"corridor_asset_id\": \"" << json_escape(a.corridor_asset_id) << "\",\n"
                << "        \"corridor_name\": \"" << json_escape(a.corridor_name) << "\",\n"
+               << "        \"severity\": \"" << a.severity << "\",\n"
+               << "        \"stack_mature\": " << (stack_mature ? "true" : "false") << ",\n"
                << "        \"velocity_mm_yr\": " << json_num(a.velocity_mm_yr, 3) << ",\n"
                << "        \"acceleration_mm_yr2\": " << json_num(a.acceleration_mm_yr2, 3) << ",\n"
                << "        \"cumulative_disp_mm\": " << json_num(a.cumulative_disp_mm, 3) << ",\n"
                << "        \"temporal_coherence\": " << json_num(a.temporal_coherence, 4) << ",\n"
                << "        \"uncertainty_mm_yr\": " << json_num(a.uncertainty_mm_yr, 3) << ",\n"
+               << "        \"velocity_snr\": " << json_num(std::min(a.velocity_snr, 1e4), 3) << ",\n"
                << "        \"pixel_x\": " << a.px << ",\n"
                << "        \"pixel_y\": " << a.py << "\n"
                << "      }\n"
@@ -1352,11 +2510,12 @@ void write_corridor_outputs(
         af << "  ]\n}\n";
     }
 
-    int crit_cnt = 0, warn_cnt = 0, watch_cnt = 0;
+    int crit_cnt = 0, warn_cnt = 0, watch_cnt = 0, maturity_gated_corridors = 0;
     for (const auto& m : metrics) {
         if (m.risk_level == "critical") crit_cnt++;
         else if (m.risk_level == "warning") warn_cnt++;
         else if (m.risk_level == "watch") watch_cnt++;
+        if (m.maturity_gated) maturity_gated_corridors++;
     }
 
     std::ofstream sf(out_dir / "stack_summary.json");
@@ -1364,23 +2523,63 @@ void write_corridor_outputs(
        << "  \"width\": " << meta.width << ",\n"
        << "  \"height\": " << meta.height << ",\n"
        << "  \"pair_count\": " << smeta.pair_count << ",\n"
+       << "  \"redundant_pair_count\": " << smeta.redundant_pair_count << ",\n"
+       << "  \"rejected_pair_count\": " << smeta.rejected_pair_count << ",\n"
        << "  \"first_t0_days\": " << json_num(smeta.first_t0_days, 3) << ",\n"
        << "  \"last_t1_days\": " << json_num(smeta.last_t1_days, 3) << ",\n"
        << "  \"total_span_days\": " << json_num(smeta.sum_dt_days, 3) << ",\n"
+       << "  \"calendar_span_days\": " << json_num(calendar_span_days, 3) << ",\n"
        << "  \"valid_stack_pixels\": " << df.valid_stack_pixels << ",\n"
        << "  \"mean_temporal_coherence\": " << json_num(df.mean_coh, 4) << ",\n"
        << "  \"mean_velocity_mm_yr\": " << json_num(df.mean_vel, 3) << ",\n"
        << "  \"p95_abs_velocity_mm_yr\": " << json_num(df.p95_abs_vel, 3) << ",\n"
+       << "  \"reference_region\": {\n"
+       << "    \"configured\": " << (ref_pin.configured ? "true" : "false") << ",\n"
+       << "    \"applied\": " << (ref_pin.applied ? "true" : "false") << ",\n"
+       << "    \"mode\": \"" << json_escape(ref_pin.mode) << "\",\n"
+       << "    \"lon\": " << json_num(ref_pin.lon, 6) << ",\n"
+       << "    \"lat\": " << json_num(ref_pin.lat, 6) << ",\n"
+       << "    \"radius_m\": " << json_num(ref_pin.radius_m, 2) << ",\n"
+       << "    \"ref_pixels_used\": " << ref_pin.ref_pixels_used << ",\n"
+       << "    \"offset_mm\": " << json_num(ref_pin.offset_mm, 4) << "\n"
+       << "  },\n"
        << "  \"ramp_removal\": {\n"
        << "    \"order\": " << ramp.order << ",\n"
        << "    \"applied\": " << (ramp.applied ? "true" : "false") << ",\n"
        << "    \"rms_before_mm\": " << json_num(ramp.rms_before_mm, 4) << ",\n"
        << "    \"rms_after_mm\": " << json_num(ramp.rms_after_mm, 4) << ",\n"
+       << "    \"masked_deform_pixels\": " << ramp.masked_deform_pixels << ",\n"
+       << "    \"masked_deform_fraction\": " << json_num(ramp.masked_deform_fraction, 4) << ",\n"
+       << "    \"dem_applied\": " << (ramp.dem_applied ? "true" : "false") << ",\n"
+       << "    \"dem_slope_mm_per_km\": " << json_num(ramp.dem_slope_mm_per_km, 4) << ",\n"
+       << "    \"dem_corr_before\": " << json_num(ramp.dem_corr_before, 4) << ",\n"
+       << "    \"dem_corr_after\": " << json_num(ramp.dem_corr_after, 4) << ",\n"
+       << "    \"dem_mean_m\": " << json_num(ramp.dem_mean_m, 2) << ",\n"
+       << "    \"dem_std_m\": " << json_num(ramp.dem_std_m, 2) << ",\n"
        << "    \"coeffs\": [";
     for (size_t i = 0; i < ramp.coeffs.size(); ++i) {
         sf << json_num(ramp.coeffs[i], 5) << (i + 1 < ramp.coeffs.size() ? ", " : "");
     }
     sf << "]\n  },\n"
+       << "  \"triplet_closure\": {\n"
+       << "    \"triplets_evaluated\": " << closure.triplets_evaluated << ",\n"
+       << "    \"mode\": \"" << json_escape(closure.mode) << "\",\n"
+       << "    \"thresh_mm\": " << json_num(closure.thresh_mm, 3) << ",\n"
+       << "    \"max_bad_frac\": " << json_num(closure.max_bad_frac, 4) << ",\n"
+       << "    \"evaluated_coherent_pixels\": " << closure.evaluated_coherent_pixels << ",\n"
+       << "    \"masked_pixels\": " << closure.masked_pixels << ",\n"
+       << "    \"bad_fraction\": " << json_num(closure.bad_fraction, 4) << ",\n"
+       << "    \"rms_mm\": " << json_num(closure.rms_mm, 4) << ",\n"
+       << "    \"pair_rejected\": " << (closure.pair_rejected ? "true" : "false") << "\n"
+       << "  },\n"
+       << "  \"maturity_gating\": {\n"
+       << "    \"min_alert_snr\": " << json_num(opt.min_alert_snr, 3) << ",\n"
+       << "    \"min_alert_span_days\": " << json_num(opt.min_alert_span_days, 2) << ",\n"
+       << "    \"actual_span_days\": " << json_num(calendar_span_days, 2) << ",\n"
+       << "    \"stack_mature\": " << (stack_mature ? "true" : "false") << ",\n"
+       << "    \"snr_gated_pixels\": " << total_snr_gated << ",\n"
+       << "    \"maturity_gated_corridors\": " << maturity_gated_corridors << "\n"
+       << "  },\n"
        << "  \"corridors\": {\n"
        << "    \"buffer_m\": " << json_num(opt.buffer_m, 2) << ",\n"
        << "    \"total_features\": " << metrics.size() << ",\n"
@@ -1410,7 +2609,10 @@ int main(int argc, char** argv) {
 
         RampResult ramp;
         ramp.order = opt.ramp_order;
+        ReferencePinResult ref_pin;
+        ClosureResult closure;
         std::vector<float> ramp_disp;
+        std::vector<float> closure_res_map;
 
         if (!opt.disp_path.empty()) {
             RasterMeta disp_meta, coh_meta;
@@ -1434,26 +2636,87 @@ int main(int argc, char** argv) {
                 ? opt.t0_days
                 : (have_existing ? smeta.last_t1_days : 0.0);
             double t1 = std::isfinite(opt.t1_days) ? opt.t1_days : (t0 + opt.dt_days);
-            if (smeta.pair_count == 0) {
-                smeta.origin_days = t0;
-                smeta.first_t0_days = t0;
+
+            std::vector<uint8_t> ref_mask = build_reference_mask(opt, meta, ref_pin);
+
+            // 1. Triplet phase closure screening BEFORE ramp fitting or stack state update
+            std::vector<uint8_t> closure_bad;
+            closure = evaluate_triplet_closure(opt, meta, ramp_disp, coh, ref_mask, closure_bad, closure_res_map);
+
+            if (closure.pair_rejected) {
+                smeta.rejected_pair_count += 1;
+                if (have_existing) {
+                    write_state_raster(opt.state_path, meta, smeta, state_bands);
+                }
+                std::cout << "insar_stack REJECTED pair (closure bad_frac="
+                          << std::fixed << std::setprecision(3) << closure.bad_fraction
+                          << " > " << closure.max_bad_frac
+                          << ", rms=" << std::setprecision(2) << closure.rms_mm << "mm)\n";
+            } else {
+                // Mask individual pixels that failed triplet phase closure
+                if (closure.masked_pixels > 0) {
+                    #pragma omp parallel for schedule(static)
+                    for (size_t i = 0; i < npix; ++i) {
+                        if (closure_bad[i]) {
+                            ramp_disp[i] = kNanF;
+                        }
+                    }
+                }
+
+                // 2. Load optional DEM aligned to stack grid
+                std::vector<float> dem;
+                if (!opt.dem_path.empty()) {
+                    dem = read_raster_aligned_f32(opt.dem_path, meta, GRA_Bilinear);
+                }
+
+                // 3. Extract coherent connected component around reference region & build deformation exclusion mask
+                std::vector<uint8_t> ref_cc = extract_reference_connected_component(
+                    meta.width, meta.height, ramp_disp, coh, ref_mask, opt.min_coh);
+                std::vector<uint8_t> deform_excl = build_deform_exclusion_mask(
+                    opt, meta, smeta, state_bands, ref_mask, ref_cc, ramp_disp, coh);
+
+                // 4. Joint robust ramp + DEM tropospheric correction on masked background
+                ramp = remove_robust_ramp_and_dem(
+                    meta.width, meta.height, ramp_disp, coh, dem, deform_excl, ref_mask, ref_cc,
+                    opt.ramp_order, opt.min_coh, opt.ramp_mask_sigma, opt.ramp_mask_dilate_px);
+
+                // 5. Pin corrected displacement to known stable reference region
+                apply_reference_pinning(ramp_disp, coh, ref_mask, opt.min_coh, ref_pin);
+
+                // 6. Incremental O(1) sufficient-statistics state update
+                const bool is_first_any = (smeta.pair_count == 0 && smeta.redundant_pair_count == 0);
+                if (is_first_any) {
+                    smeta.origin_days = t0;
+                    smeta.first_t0_days = t0;
+                    smeta.last_t1_days = t1;
+                } else {
+                    smeta.first_t0_days = std::min(smeta.first_t0_days, t0);
+                    smeta.last_t1_days = std::max(smeta.last_t1_days, t1);
+                }
+
+                update_state_incremental(
+                    state_bands, npix, ramp_disp, coh, t0, t1, smeta.origin_days, opt.min_coh,
+                    opt.redundant_pair, opt.pair_weight_scale);
+
+                if (opt.redundant_pair) {
+                    smeta.redundant_pair_count += 1;
+                } else {
+                    smeta.sum_dt_days += (t1 - t0);
+                    smeta.pair_count += 1;
+                }
+
+                write_state_raster(opt.state_path, meta, smeta, state_bands);
             }
-
-            ramp = remove_robust_ramp(
-                meta.width, meta.height, ramp_disp, coh, opt.ramp_order, opt.min_coh);
-            update_state_incremental(
-                state_bands, npix, ramp_disp, coh, t0, t1, smeta.origin_days, opt.min_coh);
-
-            smeta.last_t1_days = t1;
-            smeta.sum_dt_days += (t1 - t0);
-            smeta.pair_count += 1;
-
-            write_state_raster(opt.state_path, meta, smeta, state_bands);
         } else if (!have_existing) {
             throw std::runtime_error("Cannot export without either --disp/--coh or existing --state");
         }
 
         const size_t npix = static_cast<size_t>(meta.width) * static_cast<size_t>(meta.height);
+        const double calendar_span_days = std::max(0.0, smeta.last_t1_days - smeta.first_t0_days);
+        const int total_pairs_any = smeta.pair_count + smeta.redundant_pair_count;
+        const bool stack_mature = (calendar_span_days >= opt.min_alert_span_days) &&
+                                  (total_pairs_any >= 2 || opt.min_alert_span_days <= 0.0);
+
         if (!opt.no_export) {
             fs::path out_dir(opt.out_dir);
             fs::create_directories(out_dir);
@@ -1465,24 +2728,47 @@ int main(int argc, char** argv) {
                 write_cog_f32(out_dir / "cumulative_disp_mm.tif", meta, df.cum_disp, "Cumulative LOS Displacement (mm)");
                 write_cog_f32(out_dir / "temporal_coherence.tif", meta, df.temp_coh, "Mean Temporal Coherence");
                 write_cog_f32(out_dir / "velocity_uncertainty_mm_yr.tif", meta, df.unc, "Velocity Std Error (mm/yr)");
-                if (opt.export_ramp_disp && !ramp_disp.empty()) {
-                    write_cog_f32(out_dir / "ramp_removed_disp_mm.tif", meta, ramp_disp, "Latest Pair Ramp-Removed Displacement (mm)");
+                write_cog_f32(out_dir / "velocity_snr.tif", meta, df.snr, "Velocity Signal-to-Noise Ratio |v|/sigma_v");
+                if (opt.export_ramp_disp && !ramp_disp.empty() && !closure.pair_rejected) {
+                    write_cog_f32(out_dir / "ramp_removed_disp_mm.tif", meta, ramp_disp, "Latest Pair Corrected Displacement (mm)");
+                }
+                if (closure.triplets_evaluated > 0 && !closure_res_map.empty()) {
+                    write_cog_f32(out_dir / "closure_residual_mm.tif", meta, closure_res_map, "Triplet Phase Closure RMS Residual (mm)");
                 }
             }
 
             std::vector<CorridorMetric> metrics;
             std::vector<AlertPoint> alerts;
-            process_corridors(opt, meta, smeta, df, metrics, alerts);
-            write_corridor_outputs(out_dir, opt, meta, smeta, ramp, df, metrics, alerts);
+            size_t total_snr_gated = 0;
+            process_corridors(opt, meta, smeta, df, stack_mature, metrics, alerts, total_snr_gated);
+            write_corridor_outputs(
+                out_dir, opt, meta, smeta, ramp, ref_pin, closure, df,
+                stack_mature, calendar_span_days, total_snr_gated, metrics, alerts);
         }
 
-        std::cout << "insar_stack updated: pairs=" << smeta.pair_count
-                  << " span_days=" << std::fixed << std::setprecision(1) << smeta.sum_dt_days;
-        if (ramp.applied) {
-            std::cout << " ramp_rms=" << std::setprecision(2) << ramp.rms_before_mm
-                      << "->" << ramp.rms_after_mm << "mm";
+        if (!closure.pair_rejected) {
+            std::cout << "insar_stack updated: pairs=" << smeta.pair_count;
+            if (smeta.redundant_pair_count > 0) {
+                std::cout << " (+" << smeta.redundant_pair_count << " redundant)";
+            }
+            std::cout << " span_days=" << std::fixed << std::setprecision(1) << calendar_span_days;
+            if (ramp.applied) {
+                std::cout << " ramp_rms=" << std::setprecision(2) << ramp.rms_before_mm
+                          << "->" << ramp.rms_after_mm << "mm";
+            }
+            if (ramp.dem_applied) {
+                std::cout << " dem_slope=" << std::setprecision(2) << ramp.dem_slope_mm_per_km << "mm/km";
+            }
+            if (ref_pin.applied) {
+                std::cout << " ref_pin=" << std::setprecision(2) << ref_pin.offset_mm
+                          << "mm(" << ref_pin.ref_pixels_used << "px)";
+            }
+            if (closure.triplets_evaluated > 0) {
+                std::cout << " closure_masked=" << closure.masked_pixels
+                          << "(rms=" << std::setprecision(2) << closure.rms_mm << "mm)";
+            }
+            std::cout << "\n";
         }
-        std::cout << "\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "ERROR: " << ex.what() << "\n";

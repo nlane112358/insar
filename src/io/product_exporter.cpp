@@ -92,7 +92,9 @@ bool ProductExporter::write_summary_json(
        << "  \"iterations\": " << stats.iterations << ",\n"
        << "  \"min_displacement_mm\": " << report.min_displacement_mm << ",\n"
        << "  \"max_displacement_mm\": " << report.max_displacement_mm << ",\n"
-       << "  \"anomalies_detected\": " << report.anomalies.size() << ",\n";
+       << "  \"anomalies_detected\": " << report.anomalies.size() << ",\n"
+       << "  \"ref_region_pinned\": " << (stats.ref_region_pinned ? "true" : "false") << ",\n"
+       << "  \"ref_pixels_used\": " << stats.ref_pixels_used << ",\n";
 
     if (report.bbox.valid) {
         sj << std::setprecision(9)
