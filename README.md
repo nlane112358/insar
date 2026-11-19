@@ -6,7 +6,11 @@ Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stackin
 
 ## Ground-Truth GNSS Validation — Mexico City (`T041_086877_IW1`)
 
-![GNSS Ground-Truth Validation Benchmark — Mexico City IW1](docs/figures/mexico_city_gnss_validation.png)
+<p align="center">
+  <img src="docs/figures/mexico_city_gnss_map.png" alt="GNSS and InSAR LOS velocity map — Mexico City IW1" width="32%" />
+  <img src="docs/figures/mexico_city_gnss_scatter.png" alt="GNSS versus InSAR LOS velocity scatter plot" width="32%" />
+  <img src="docs/figures/mexico_city_gnss_timeseries.png" alt="GNSS and InSAR cumulative displacement time series at MMX1" width="32%" />
+</p>
 
 *Independent validation of a 24-pair Sentinel-1 OPERA CSLC-S1 stack (19 Jun – 17 Nov 2026, 145 stacked days) against 6 Nevada Geodetic Laboratory (UNR) North-America-fixed GNSS stations projected onto exact Sentinel-1 zero-Doppler LOS vectors (from OPERA ECEF orbit state vectors). Full per-station tables: [`data/validation/mexico_city_gnss_validation.json`](data/validation/mexico_city_gnss_validation.json) · [`mexico_city_gnss_validation.csv`](data/validation/mexico_city_gnss_validation.csv).*
 
@@ -53,7 +57,7 @@ Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stackin
 | **Online Stacker** | [`src/insar_stack_cpu.cpp`](src/insar_stack_cpu.cpp) · `insar_stack` | $O(1)$ per-pass updates to a 13-band Float64 sufficient-statistics raster (`stack_state.tif`), connected-component reference pinning, explicit/two-pass high-deformation masking, joint robust polynomial + DEM tropospheric regression (`--dem`), skip-1/skip-2 triplet phase closure masking & corrupted-pair rejection, velocity/uncertainty/SNR/acceleration COGs, and SNR + stack-maturity gated corridor risk analytics |
 | **Ingestion** | [`scripts/auto_ingest.py`](scripts/auto_ingest.py) | Automated Sentinel-1 OPERA & NISAR L-band discovery, `--max-skip {0,1,2}` redundant pair network generation, SQLite state tracking, and dispatch to `insar_proto` + `insar_stack` |
 | **Stack Runner** | [`scripts/stack_timeseries.py`](scripts/stack_timeseries.py) | Chronological + skip-pair network discovery, automatic closure triplet assembly, two-pass high-deformation masking, and incremental `insar_stack` dispatch |
-| **DEM & GNSS Validation** | [`scripts/fetch_dem.py`](scripts/fetch_dem.py) · [`scripts/validate_gnss.py`](scripts/validate_gnss.py) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation with exact zero-Doppler orbit projection and 3-panel benchmark plotting |
+| **DEM & GNSS Validation** | [`scripts/fetch_dem.py`](scripts/fetch_dem.py) · [`scripts/validate_gnss.py`](scripts/validate_gnss.py) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
 | **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) | Standalone publication maps for `velocity`, `cumulative`, `coherence`, `uncertainty`, and `acceleration` layers |
 | **Unified OEM API & Docker** | [`api/server.py`](api/server.py) · [`Dockerfile`](Dockerfile) · [`sdk/demo_client.py`](sdk/demo_client.py) | FastAPI service unifying `insar_proto` (`/v1/jobs`) and `insar_stack` (`/v1/stacks/{stack_id}/updates`, `/v1/stacks`), STAC 1.1.0 pair & stack items, Range-streamable COGs, `/health`, and HMAC-SHA256 webhooks; multi-stage Docker container bundling both C++ binaries |
 
@@ -94,14 +98,16 @@ python3 scripts/stack_timeseries.py \
   --corridors data/corridors/mexico_city_corridors.geojson \
   --min-alert-snr 2.5 --min-alert-span-days 60
 
-# 4. Validate against UNR/NGL GNSS stations and render the 3-panel benchmark figure
+# 4. Validate against UNR/NGL GNSS stations and render standalone benchmark figures
 python3 scripts/validate_gnss.py \
   --stack-dir insar_work/stacks/mexico_city_iw1 \
   --products-dir insar_work/products/mexico_city_iw1 \
   --dem insar_work/dem/mexico_city_iw1_cop30.tif \
   --slc-h5 insar_work/raw/mexico_city_iw1 \
   --out-json data/validation/mexico_city_gnss_validation.json \
-  --plot-out docs/figures/mexico_city_gnss_validation.png
+  --map-out docs/figures/mexico_city_gnss_map.png \
+  --scatter-out docs/figures/mexico_city_gnss_scatter.png \
+  --timeseries-out docs/figures/mexico_city_gnss_timeseries.png
 
 # 5. Render a standalone cartographic velocity map
 python3 scripts/plots/plot_raster_map.py \

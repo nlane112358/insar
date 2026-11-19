@@ -77,6 +77,7 @@ class StackConfig:
     min_alert_coh: float = 0.55
     min_alert_snr: float = 2.5
     min_alert_span_days: float = 60.0
+    snapshots_dir: Path | None = None
     reset: bool = False
 
 
@@ -521,7 +522,11 @@ def _sync_stack_single_pass(
             total_triplets_run += len(triplets)
 
         if not is_last:
-            if cfg.corridors is not None and not is_redundant:
+            if cfg.snapshots_dir is not None:
+                # Keep the per-pass COGs available for a caller that is exporting
+                # cumulative-history frames. The default path still skips these writes.
+                pass
+            elif cfg.corridors is not None and not is_redundant:
                 cmd.append("--skip-cog")
             else:
                 cmd.append("--no-export")
@@ -541,6 +546,15 @@ def _sync_stack_single_pass(
                 newly_stacked_primary += 1
                 if cfg.corridors is not None:
                     _update_corridor_timeseries(ts_data, origin_date, pair, corridor_report_path)
+                if cfg.snapshots_dir is not None:
+                    cfg.snapshots_dir.mkdir(parents=True, exist_ok=True)
+                    for layer_name in ("cumulative_disp_mm.tif", "temporal_coherence.tif"):
+                        layer_path = cfg.out_dir / layer_name
+                        if layer_path.is_file():
+                            shutil.copy2(
+                                layer_path,
+                                cfg.snapshots_dir / f"{pair.sec_date}_{layer_name}",
+                            )
 
     # Refresh export cleanly if no new pairs arrived but corridor/alert params changed
     export_changed = ledger.get("export_params") != export_params
@@ -603,6 +617,7 @@ def sync_stack(cfg: StackConfig) -> StackRunSummary:
                     out_dir=pass1_dir,
                     corridors=None,
                     two_pass_deform_mask=False,
+                    snapshots_dir=None,
                     reset=True,
                 )
                 print(f"[two-pass] Pass 1: estimating initial deformation field ({len(chain)} pairs)...")
@@ -879,6 +894,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-alert-coh", type=float, default=0.55, help="Minimum temporal coherence for alerts")
     p.add_argument("--min-alert-snr", type=float, default=2.5, help="Minimum velocity SNR |v|/sigma_v for alerts (default: 2.5)")
     p.add_argument("--min-alert-span-days", type=float, default=60.0, help="Minimum stack span in days before critical velocity alerts (default: 60.0)")
+    p.add_argument("--snapshot-dir", type=Path, default=None, help="Optional directory for per-pair cumulative displacement and coherence COG snapshots; use with --reset to rebuild history")
     p.add_argument("--reset", action="store_true", help="Reset state/ledger and rebuild full stack cleanly")
     p.add_argument("--plot", action="store_true", help="Render stack_preview.png dashboard after updating")
     p.add_argument("--plot-only", action="store_true", help="Render plot from an existing --out-dir stack")
@@ -924,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
         min_alert_coh=args.min_alert_coh,
         min_alert_snr=args.min_alert_snr,
         min_alert_span_days=args.min_alert_span_days,
+        snapshots_dir=args.snapshot_dir,
         reset=args.reset,
     )
     summary = sync_stack(cfg)

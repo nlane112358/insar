@@ -193,17 +193,32 @@ class TestFetchDemAndGnssValidation(unittest.TestCase):
 
             out_json = tp / "val.json"
             out_csv = tp / "val.csv"
+            map_out = tp / "figs" / "val_map.png"
+            scatter_out = tp / "figs" / "val_scatter.png"
+            ts_out = tp / "figs" / "val_ts.png"
+            baseline_csv = tp / "baseline.csv"
+            with open(baseline_csv, "w", encoding="utf-8", newline="") as fh:
+                w_base = csv.DictWriter(fh, fieldnames=["station_id", "baseline_insar_los_mm_yr"])
+                w_base.writeheader()
+                for idx, px in enumerate((12, 30, 50, 68)):
+                    w_base.writerow({"station_id": f"ST0{idx}", "baseline_insar_los_mm_yr": f"{-2.5 * px:.2f}"})
+
             subprocess.run(
                 [
                     "/opt/homebrew/bin/python3",
                     str(Path(__file__).resolve().parent.parent / "scripts" / "validate_gnss.py"),
                     "--stack-dir", str(stack_dir),
                     "--gnss-csv", str(csv_p),
+                    "--baseline-csv", str(baseline_csv),
                     "--incidence-deg", "34.0",
                     "--heading-deg", "-169.0",
                     "--sample-radius-m", "90.0",
                     "--out-json", str(out_json),
                     "--out-csv", str(out_csv),
+                    "--map-out", str(map_out),
+                    "--scatter-out", str(scatter_out),
+                    "--timeseries-out", str(ts_out),
+                    "--dpi", "120",
                 ],
                 check=True,
                 capture_output=True,
@@ -211,9 +226,13 @@ class TestFetchDemAndGnssValidation(unittest.TestCase):
             )
             res = json.loads(out_json.read_text(encoding="utf-8"))
             self.assertEqual(res["metrics"]["n_stations"], 4)
+            self.assertIsNotNone(res["baseline_metrics"])
             self.assertLess(res["metrics"]["rmse_mm_yr"], 2.0)
             self.assertGreater(res["metrics"]["r2"], 0.999)
             self.assertTrue(out_csv.is_file())
+            for fig_p in (map_out, scatter_out, ts_out):
+                self.assertTrue(fig_p.is_file())
+                self.assertGreater(fig_p.stat().st_size, 1000)
 
 
 if __name__ == "__main__":

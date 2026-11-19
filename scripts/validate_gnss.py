@@ -698,62 +698,83 @@ def _extract_pair_timeseries_at_station(
     return (epochs, cum_mm) if len(epochs) >= 3 else None
 
 
-def render_gnss_benchmark_plot(
-    stack_dir: Path,
-    matches: list[StationMatch],
-    metrics: dict[str, float],
-    out_path: Path,
-    *,
-    baseline_metrics: dict[str, float] | None = None,
-    ref_lonlat: tuple[float, float] | None = None,
-    insar_sign: float = -1.0,
-    ts_station: GnssStation | None = None,
-    ts_gnss_dates: list[date] | None = None,
-    ts_gnss_los_mm: list[float] | None = None,
-    ts_insar_dates: list[date] | None = None,
-    ts_insar_los_mm: list[float] | None = None,
-    ts_rmse_mm: float | None = None,
-    dpi: int = 220,
-) -> Path:
-    """Render 3-panel publication-grade GNSS ground-truth validation benchmark figure."""
-    plots_dir = Path(__file__).resolve().parent / "plots"
-    if str(plots_dir) not in sys.path:
-        sys.path.insert(0, str(plots_dir))
-    from _common import (  # noqa: E402
-        INK,
-        MUTED,
-        NODATA_BG,
-        add_editorial_header,
-        add_footer,
-        add_scalebar,
-        build_wgs84_to_raster_ct,
-        configure_matplotlib,
-        format_date_range,
-        format_site_label,
-        load_raster,
-        load_stack_ledger,
-        load_stack_summary,
-        make_diverging_cmap,
-        save_figure,
+def _configure_scientific_matplotlib() -> Any:
+    """Apply clean, standard scientific matplotlib rcParams without editorial styling."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update(
+        {
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "savefig.facecolor": "white",
+            "savefig.edgecolor": "none",
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+            "mathtext.fontset": "dejavusans",
+            "font.size": 10.0,
+            "axes.labelsize": 10.0,
+            "axes.labelweight": "normal",
+            "axes.edgecolor": "black",
+            "axes.linewidth": 0.85,
+            "axes.spines.top": True,
+            "axes.spines.right": True,
+            "xtick.color": "black",
+            "ytick.color": "black",
+            "xtick.labelsize": 9.0,
+            "ytick.labelsize": 9.0,
+            "text.color": "black",
+            "legend.frameon": True,
+            "legend.fancybox": False,
+        }
     )
-    import matplotlib.dates as mdates  # noqa: E402
-    import matplotlib.gridspec as gridspec  # noqa: E402
-    import matplotlib.patheffects as pe  # noqa: E402
-    from matplotlib.cm import ScalarMappable  # noqa: E402
-    from matplotlib.colors import Normalize  # noqa: E402
-    from matplotlib.ticker import FuncFormatter, MaxNLocator  # noqa: E402
+    return plt
 
-    plt = configure_matplotlib()
-    vel_layer = load_raster(stack_dir / "velocity_mm_yr.tif")
-    coh_layer = load_raster(stack_dir / "temporal_coherence.tif")
-    summary = load_stack_summary(stack_dir)
-    ledger = load_stack_ledger(stack_dir)
 
-    # Display velocity in intuitive geodetic convention (negative = subsidence away from satellite)
-    vel_disp = insar_sign * vel_layer.data
-    ct = build_wgs84_to_raster_ct(vel_layer.projection_wkt)
+def _utm_axis_labels(projection_wkt: str) -> tuple[str, str]:
+    """Derive UTM zone Easting/Northing axis labels from raster WKT when available."""
+    if projection_wkt:
+        from osgeo import osr  # type: ignore
 
-    # Focus map tightly on the urban basin containing all GNSS stations + reference region
+        srs = osr.SpatialReference()
+        if srs.ImportFromWkt(projection_wkt) == 0:
+            zone = srs.GetUTMZone()
+            if zone > 0:
+                return f"UTM {zone}N Easting (km)", f"UTM {zone}N Northing (km)"
+            if zone < 0:
+                return f"UTM {-zone}S Easting (km)", f"UTM {-zone}S Northing (km)"
+    return "Easting (km)", "Northing (km)"
+
+
+def _draw_cartographic_scalebar(ax: Any, xmin: float, xmax: float, ymin: float, ymax: float) -> None:
+    """Draw a minimal alternating black-and-white kilometer scale bar."""
+    from matplotlib.patches import Rectangle
+
+    width_m = xmax - xmin
+    height_m = ymax - ymin
+    target = width_m * 0.18
+    nice_steps = [500, 1000, 2000, 5000, 10000, 20000, 50000]
+    bar_m = min(nice_steps, key=lambda s: abs(s - target))
+    label = f"{bar_m // 1000} km" if bar_m >= 1000 else f"{bar_m} m"
+
+    x0 = xmin + 0.05 * width_m
+    y0 = ymin + 0.06 * height_m
+    bar_h = 0.012 * height_m
+    ax.add_patch(Rectangle((x0, y0), bar_m / 2.0, bar_h, facecolor="black", edgecolor="black", lw=0.7, zorder=8))
+    ax.add_patch(Rectangle((x0 + bar_m / 2.0, y0), bar_m / 2.0, bar_h, facecolor="white", edgecolor="black", lw=0.7, zorder=8))
+    ax.text(x0, y0 + bar_h + 0.01 * height_m, "0", fontsize=8.5, ha="center", va="bottom", color="black", zorder=8)
+    ax.text(x0 + bar_m, y0 + bar_h + 0.01 * height_m, label, fontsize=8.5, ha="center", va="bottom", color="black", zorder=8)
+
+
+def _compute_map_view_and_norm(
+    vel_disp: np.ndarray,
+    vel_extent: tuple[float, float, float, float],
+    ct: Any,
+    matches: Sequence[StationMatch],
+    ref_lonlat: tuple[float, float] | None,
+) -> tuple[tuple[float, float, float, float], float]:
     pts_utm = [ct.TransformPoint(m.lon, m.lat, 0.0)[:2] for m in matches]
     if ref_lonlat is not None:
         pts_utm.append(ct.TransformPoint(ref_lonlat[0], ref_lonlat[1], 0.0)[:2])
@@ -761,189 +782,256 @@ def render_gnss_benchmark_plot(
     ys_u = [p[1] for p in pts_utm]
     pad_x = max(7000.0, 0.35 * (max(xs_u) - min(xs_u)))
     pad_y = max(6000.0, 0.35 * (max(ys_u) - min(ys_u)))
-    xmin = max(vel_layer.extent[0], min(xs_u) - pad_x)
-    xmax = min(vel_layer.extent[1], max(xs_u) + pad_x)
-    ymin = max(vel_layer.extent[2], min(ys_u) - pad_y)
-    ymax = min(vel_layer.extent[3], max(ys_u) + pad_y)
+    xmin = max(vel_extent[0], min(xs_u) - pad_x)
+    xmax = min(vel_extent[1], max(xs_u) + pad_x)
+    ymin = max(vel_extent[2], min(ys_u) - pad_y)
+    ymax = min(vel_extent[3], max(ys_u) + pad_y)
 
-    # Use inverted diverging map so red/crimson = negative (subsidence), blue = positive (uplift)
-    cmap = make_diverging_cmap().reversed()
     max_mag = max(
         [abs(m.gnss_los_mm_yr) for m in matches]
         + [abs(m.insar_los_mm_yr) for m in matches]
         + [100.0]
     )
     vlim = math.ceil((max_mag * 1.15) / 50.0) * 50.0
-    norm = Normalize(vmin=-vlim, vmax=vlim, clip=True)
+    return (xmin, xmax, ymin, ymax), vlim
 
-    fig = plt.figure(figsize=(15.4, 9.4))
-    gs = gridspec.GridSpec(
-        2, 2,
-        width_ratios=[1.22, 1.0],
-        height_ratios=[1.12, 0.92],
-        left=0.055, right=0.965, top=0.875, bottom=0.165,
-        wspace=0.25, hspace=0.34,
+
+def render_gnss_velocity_map(
+    stack_dir: Path,
+    matches: list[StationMatch],
+    out_path: Path,
+    *,
+    ref_lonlat: tuple[float, float] | None = None,
+    insar_sign: float = -1.0,
+    min_plot_coh: float = 0.25,
+    dpi: int = 300,
+) -> Path:
+    """Render standalone InSAR LOS velocity map with GNSS stations and reference point."""
+    plots_dir = Path(__file__).resolve().parent / "plots"
+    if str(plots_dir) not in sys.path:
+        sys.path.insert(0, str(plots_dir))
+    from _common import build_wgs84_to_raster_ct, load_raster, save_figure  # noqa: E402
+    import matplotlib.patheffects as pe  # noqa: E402
+    from matplotlib.cm import ScalarMappable  # noqa: E402
+    from matplotlib.colors import Normalize  # noqa: E402
+    from matplotlib.lines import Line2D  # noqa: E402
+    from matplotlib.ticker import FuncFormatter, MultipleLocator  # noqa: E402
+    from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: E402
+
+    plt = _configure_scientific_matplotlib()
+    vel_layer = load_raster(stack_dir / "velocity_mm_yr.tif")
+    coh_layer = load_raster(stack_dir / "temporal_coherence.tif")
+    vel_disp = insar_sign * vel_layer.data
+    ct = build_wgs84_to_raster_ct(vel_layer.projection_wkt)
+
+    (xmin, xmax, ymin, ymax), vlim = _compute_map_view_and_norm(
+        vel_disp, vel_layer.extent, ct, matches, ref_lonlat
+    )
+    norm = Normalize(vmin=-vlim, vmax=vlim, clip=True)
+    cmap = plt.get_cmap("RdBu").copy()
+    cmap.set_bad("#EAEAEA")
+
+    fig, ax = plt.subplots(figsize=(7.2, 5.8))
+    ax.set_facecolor("#EAEAEA")
+    masked_vel = np.where(np.isfinite(vel_disp) & (coh_layer.data >= min_plot_coh), vel_disp, np.nan)
+    ax.imshow(
+        masked_vel,
+        extent=vel_layer.extent,
+        origin="upper",
+        cmap=cmap,
+        norm=norm,
+        interpolation="nearest",
+        zorder=2,
     )
 
-    # ---------------- Panel A: Spatial Map + GNSS Stations ----------------
-    ax_map = fig.add_subplot(gs[:, 0])
-    ax_map.set_facecolor(NODATA_BG)
-
-    finite = np.isfinite(vel_disp)
-    rgba = cmap(norm(np.where(finite, vel_disp, 0.0)))
-    c_safe = np.where(np.isfinite(coh_layer.data), coh_layer.data, 0.0)
-    alpha = np.clip((c_safe - 0.28) / 0.28, 0.18, 1.0)
-    rgba[..., 3] = np.where(finite, alpha, 0.0)
-    ax_map.imshow(rgba, extent=vel_layer.extent, origin="upper", interpolation="nearest", zorder=2)
-
-    # Plot UNR GNSS stations as circles filled with GNSS LOS velocity on the IDENTICAL colormap
-    map_label_offsets: dict[str, tuple[float, float, str]] = {
-        "MXAZ": (950.0, 500.0, "left"),
-        "UNVA": (950.0, 450.0, "left"),
-        "MMX1": (0.0, -1550.0, "center"),
-        "MXMX": (950.0, 750.0, "left"),
-        "UTAC": (-950.0, -1050.0, "right"),
-        "ICMX": (950.0, -1100.0, "left"),
+    label_offsets: dict[str, tuple[float, float, str, str]] = {
+        "MXAZ": (900.0, 450.0, "left", "bottom"),
+        "UNVA": (900.0, 400.0, "left", "bottom"),
+        "MMX1": (0.0, -1450.0, "center", "top"),
+        "MXMX": (900.0, 500.0, "left", "bottom"),
+        "UTAC": (-900.0, -700.0, "right", "top"),
+        "ICMX": (900.0, -700.0, "left", "top"),
     }
     for m in matches:
         ux, uy, _ = ct.TransformPoint(m.lon, m.lat, 0.0)
         col = cmap(norm(m.gnss_los_mm_yr))
-        ax_map.scatter(
-            [ux], [uy], s=145, color=col, edgecolors="#111111", linewidths=1.8, zorder=10
-        )
-        dx_off, dy_off, ha = map_label_offsets.get(m.station_id, (950.0, 700.0, "left"))
-        lbl = f"{m.station_id}\nGNSS {m.gnss_los_mm_yr:+.0f} | InSAR {m.insar_los_mm_yr:+.0f}"
-        ax_map.text(
-            ux + dx_off,
-            uy + dy_off,
-            lbl,
-            fontsize=7.8,
-            fontweight="bold",
-            color=INK,
+        ax.scatter([ux], [uy], s=95, color=col, edgecolors="black", linewidths=1.2, zorder=6)
+        dx, dy, ha, va = label_offsets.get(m.station_id, (850.0, 450.0, "left", "bottom"))
+        ax.text(
+            ux + dx,
+            uy + dy,
+            m.station_id,
+            fontsize=8.5,
+            color="black",
             ha=ha,
-            va="center",
-            zorder=12,
-            path_effects=[pe.withStroke(linewidth=2.8, foreground="#FFFFFF", alpha=0.95)],
+            va=va,
+            zorder=7,
+            path_effects=[pe.withStroke(linewidth=2.0, foreground="white", alpha=0.88)],
         )
 
+    legend_handles = [
+        Line2D(
+            [0], [0], marker="o", color="none", markerfacecolor="white",
+            markeredgecolor="black", markeredgewidth=1.1, markersize=7.0, label="GNSS station",
+        )
+    ]
     if ref_lonlat is not None:
         rx, ry, _ = ct.TransformPoint(ref_lonlat[0], ref_lonlat[1], 0.0)
-        ax_map.scatter(
-            [rx], [ry], s=180, marker="*", color="#FFD166", edgecolors="#111111", linewidths=1.3,
-            zorder=11, label="Stable Bedrock Ref Pin (0 mm/yr)",
-        )
-        ax_map.text(
-            rx - 900.0, ry + 550.0, "REF PIN\n(Bedrock)",
-            fontsize=7.6, fontweight="bold", color=INK, ha="right", va="center", zorder=12,
-            path_effects=[pe.withStroke(linewidth=2.6, foreground="#FFFFFF", alpha=0.92)],
+        ax.scatter([rx], [ry], s=140, marker="*", color="#FFD700", edgecolors="black", linewidths=0.9, zorder=7)
+        legend_handles.append(
+            Line2D(
+                [0], [0], marker="*", color="none", markerfacecolor="#FFD700",
+                markeredgecolor="black", markeredgewidth=0.8, markersize=9.5, label="Reference point",
+            )
         )
 
-    ax_map.set_xlim(xmin, xmax)
-    ax_map.set_ylim(ymin, ymax)
-    ax_map.set_aspect("equal", adjustable="box")
-    km_fmt = FuncFormatter(lambda v, _: f"{v / 1000.0:,.0f}")
-    ax_map.xaxis.set_major_formatter(km_fmt)
-    ax_map.yaxis.set_major_formatter(km_fmt)
-    ax_map.xaxis.set_major_locator(MaxNLocator(nbins=5))
-    ax_map.yaxis.set_major_locator(MaxNLocator(nbins=5))
-    ax_map.set_xlabel("UTM Zone 14N Easting (km)")
-    ax_map.set_ylabel("UTM Zone 14N Northing (km)")
-    ax_map.set_title("A. InSAR LOS Velocity Map & Independent UNR GNSS Stations", loc="left", pad=8)
-    for sp in ("top", "right", "bottom", "left"):
-        ax_map.spines[sp].set_visible(True)
-        ax_map.spines[sp].set_color("#B8C2CC")
-    add_scalebar(ax_map, xmin, xmax, ymin, ymax)
+    ax.legend(
+        handles=legend_handles, loc="upper right", fontsize=8.5,
+        frameon=True, fancybox=False, edgecolor="0.65", facecolor="white", framealpha=0.95,
+    )
+    _draw_cartographic_scalebar(ax, xmin, xmax, ymin, ymax)
 
-    # Colorbar cleanly beneath Panel A with generous clearance above footer
-    pos_a = ax_map.get_position()
-    cax = fig.add_axes([pos_a.x0 + 0.02, 0.082, pos_a.width - 0.04, 0.017])
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal", adjustable="box")
+    km_fmt = FuncFormatter(lambda v, _: f"{v / 1000.0:.0f}")
+    ax.xaxis.set_major_formatter(km_fmt)
+    ax.yaxis.set_major_formatter(km_fmt)
+    tick_step = 5000.0 if (xmax - xmin) <= 45000.0 else 10000.0
+    ax.xaxis.set_major_locator(MultipleLocator(tick_step))
+    ax.yaxis.set_major_locator(MultipleLocator(tick_step))
+    ax.tick_params(direction="out", length=4.0, width=0.8, top=False, right=False)
+    xlabel, ylabel = _utm_axis_labels(vel_layer.projection_wkt)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="3.5%", pad=0.12)
     sm = ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
-    cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
-    cb.set_label("LOS Velocity (mm/yr · negative = subsidence away from satellite)", fontsize=8.8, labelpad=3)
-    cb.ax.tick_params(labelsize=8.2)
+    cb = fig.colorbar(sm, cax=cax, extend="both")
+    cb.set_label("LOS velocity (mm/yr)", labelpad=6)
+    cb.ax.tick_params(labelsize=8.5, length=3.5, width=0.8)
 
-    # ---------------- Panel B: 1:1 Scatter Plot ----------------
-    ax_sc = fig.add_subplot(gs[0, 1])
+    fig.tight_layout()
+    save_figure(fig, out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved GNSS velocity map -> {out_path}")
+    return out_path
+
+
+def render_gnss_scatter_plot(
+    matches: list[StationMatch],
+    out_path: Path,
+    *,
+    dpi: int = 300,
+) -> Path:
+    """Render standalone 1:1 GNSS vs. InSAR LOS velocity scatter figure."""
+    plots_dir = Path(__file__).resolve().parent / "plots"
+    if str(plots_dir) not in sys.path:
+        sys.path.insert(0, str(plots_dir))
+    from _common import save_figure  # noqa: E402
+    from matplotlib.ticker import MultipleLocator  # noqa: E402
+
+    plt = _configure_scientific_matplotlib()
+    fig, ax = plt.subplots(figsize=(5.6, 5.4))
+
     gx = np.array([m.gnss_los_mm_yr for m in matches])
     iy = np.array([m.insar_los_mm_yr for m in matches])
     g_err = np.array([m.gnss_los_sigma_mm_yr for m in matches])
     i_err = np.array([m.insar_spatial_std_mm_yr for m in matches])
 
-    lo_lim = min(float(np.min(gx)), float(np.min(iy)), -40.0) - 25.0
-    hi_lim = max(float(np.max(gx)), float(np.max(iy)), 25.0) + 32.0
-    line_x = np.linspace(lo_lim, hi_lim, 100)
-    ax_sc.fill_between(line_x, line_x - 20.0, line_x + 20.0, color="#E4E7EC", alpha=0.45, label="±20 mm/yr band")
-    ax_sc.fill_between(line_x, line_x - 10.0, line_x + 10.0, color="#CBD5E1", alpha=0.55, label="±10 mm/yr band")
-    ax_sc.plot(line_x, line_x, "--", color="#1B222C", linewidth=1.3, label="1:1 Identity")
+    bx = [m.gnss_los_mm_yr for m in matches if m.baseline_insar_los_mm_yr is not None]
+    by = [m.baseline_insar_los_mm_yr for m in matches if m.baseline_insar_los_mm_yr is not None]
 
-    # Show baseline points faded in background if available
-    if baseline_metrics is not None and any(m.baseline_insar_los_mm_yr is not None for m in matches):
-        bx = [m.gnss_los_mm_yr for m in matches if m.baseline_insar_los_mm_yr is not None]
-        by = [m.baseline_insar_los_mm_yr for m in matches if m.baseline_insar_los_mm_yr is not None]
-        ax_sc.scatter(
-            bx, by, s=46, marker="x", color="#9CA3AF", linewidths=1.3, zorder=4,
-            label=f"Baseline unmasked (RMSE {baseline_metrics['rmse_mm_yr']:.1f} mm/yr)",
-        )
+    all_lo = [float(np.min(gx - g_err)), float(np.min(iy - i_err)), -40.0] + ([float(min(by))] if by else [])
+    all_hi = [float(np.max(gx + g_err)), float(np.max(iy + i_err)), 25.0] + ([float(max(by))] if by else [])
+    lo_lim = min(all_lo) - 18.0
+    hi_lim = max(all_hi) + 14.0
+    line_x = np.linspace(lo_lim, hi_lim, 200)
 
-    ax_sc.errorbar(
-        gx, iy, xerr=g_err, yerr=i_err, fmt="o", markersize=7.5,
-        color="#B8332A", ecolor="#596574", elinewidth=1.1, capsize=3,
-        markeredgecolor="#FFFFFF", markeredgewidth=0.9, zorder=8,
-        label=f"Upgraded stack ±1σ spatial (RMSE {metrics['rmse_mm_yr']:.1f} mm/yr)",
+    ax.fill_between(line_x, line_x - 20.0, line_x + 20.0, color="0.91", alpha=0.8, zorder=1, label="±20 mm/yr")
+    ax.fill_between(line_x, line_x - 10.0, line_x + 10.0, color="0.81", alpha=0.8, zorder=2, label="±10 mm/yr")
+    ax.plot(line_x, line_x, "k--", linewidth=1.0, zorder=3, label="1:1 line")
+
+    if bx and by:
+        ax.scatter(bx, by, marker="x", s=40, color="0.45", linewidths=1.2, zorder=4, label="Baseline (unmasked)")
+
+    ax.errorbar(
+        gx, iy, xerr=g_err, yerr=i_err, fmt="o", markersize=6.0,
+        color="#c0392b", ecolor="0.25", elinewidth=1.0, capsize=2.5,
+        markeredgecolor="black", markeredgewidth=0.6, zorder=6,
+        label="InSAR stack (±1σ)",
     )
-    scatter_label_offsets: dict[str, tuple[float, float, str]] = {
-        "MMX1": (10.0, 10.0, "left"),
-        "ICMX": (-12.0, 9.0, "right"),
-        "UNVA": (-26.0, -18.0, "right"),
-        "MXMX": (18.0, -24.0, "left"),
-        "UTAC": (16.0, -5.0, "left"),
-        "MXAZ": (-12.0, 9.0, "right"),
+
+    scatter_label_offsets: dict[str, tuple[float, float, str, str, bool]] = {
+        "MMX1": (14.0, -14.0, "left", "top", False),
+        "MXAZ": (-8.0, 4.0, "right", "bottom", False),
+        "ICMX": (-10.0, 6.0, "right", "bottom", False),
+        "UNVA": (-14.0, -34.0, "right", "top", True),
+        "MXMX": (12.0, -28.0, "left", "top", True),
+        "UTAC": (16.0, -4.0, "left", "center", True),
     }
     for m in matches:
-        off_x, off_y, ha = scatter_label_offsets.get(
-            m.station_id,
-            (8.0 if m.gnss_los_mm_yr < -100 else -8.0, 8.0, "left" if m.gnss_los_mm_yr < -100 else "right"),
-        )
-        use_arrow = m.station_id in {"UNVA", "MXMX", "UTAC"}
-        ax_sc.annotate(
+        default_off = (10.0, -10.0, "left", "top", False) if m.gnss_los_mm_yr < -100 else (-8.0, 6.0, "right", "bottom", False)
+        ox, oy, ha, va, arr = scatter_label_offsets.get(m.station_id, default_off)
+        ax.annotate(
             m.station_id,
             (m.gnss_los_mm_yr, m.insar_los_mm_yr),
-            xytext=(off_x, off_y),
+            xytext=(ox, oy),
             textcoords="offset points",
-            fontsize=8.0,
-            fontweight="bold",
-            color=INK,
+            fontsize=8.2,
+            color="black",
             ha=ha,
-            va="center",
-            arrowprops={"arrowstyle": "-", "color": "#8C98A6", "lw": 0.8} if use_arrow else None,
+            va=va,
+            zorder=7,
+            arrowprops={"arrowstyle": "-", "color": "0.45", "lw": 0.7} if arr else None,
         )
 
-    kpi_lines = [
-        f"N = {metrics['n_stations']} UNR GNSS stations",
-        f"RMSE = {metrics['rmse_mm_yr']:.1f} mm/yr (de-biased: {metrics['rmse_debiased_mm_yr']:.1f})",
-        f"MAE  = {metrics['mae_mm_yr']:.1f} mm/yr  ·  Bias = {metrics['bias_mm_yr']:+.1f}",
-        f"R²   = {metrics['r2']:.3f}  ·  r = {metrics['pearson_r']:.3f}",
-    ]
-    if baseline_metrics is not None:
-        kpi_lines.append(f"Baseline RMSE: {baseline_metrics['rmse_mm_yr']:.1f} → {metrics['rmse_mm_yr']:.1f} mm/yr")
-    ax_sc.text(
-        0.03, 0.96, "\n".join(kpi_lines),
-        transform=ax_sc.transAxes,
-        fontsize=8.3, family="monospace", color=INK, va="top", ha="left",
-        bbox={"boxstyle": "round,pad=0.45", "facecolor": "#F8F7F4", "edgecolor": "#C8D0DA", "alpha": 0.95},
-        zorder=10,
+    ax.set_xlim(lo_lim, hi_lim)
+    ax.set_ylim(lo_lim, hi_lim)
+    ax.set_aspect("equal", adjustable="box")
+    ax.xaxis.set_major_locator(MultipleLocator(50))
+    ax.yaxis.set_major_locator(MultipleLocator(50))
+    ax.set_axisbelow(True)
+    ax.grid(True, linestyle=":", linewidth=0.6, color="0.80")
+    ax.tick_params(direction="in", top=True, right=True, length=4.0, width=0.8)
+    ax.set_xlabel("UNR GNSS LOS velocity (mm/yr)")
+    ax.set_ylabel("InSAR LOS velocity (mm/yr)")
+    ax.legend(
+        loc="lower right", fontsize=8.3,
+        frameon=True, fancybox=False, edgecolor="0.65", facecolor="white", framealpha=0.95,
     )
-    ax_sc.set_xlim(lo_lim, hi_lim)
-    ax_sc.set_ylim(lo_lim, hi_lim)
-    ax_sc.grid(True, alpha=0.55)
-    ax_sc.set_xlabel("UNR GNSS Projected LOS Velocity (mm/yr)")
-    ax_sc.set_ylabel("InSAR Stack LOS Velocity (mm/yr)")
-    ax_sc.set_title("B. Ground-Truth Velocity Agreement (InSAR vs. UNR GNSS)", loc="left", pad=8)
-    ax_sc.legend(loc="lower right", fontsize=7.6, frameon=True, facecolor="#FFFFFF", framealpha=0.9, edgecolor="#D5DCE4")
 
-    # ---------------- Panel C: Overlapping 2026 Time Series OR Residual Comparison ----------------
-    ax_c = fig.add_subplot(gs[1, 1])
+    fig.tight_layout()
+    save_figure(fig, out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved GNSS scatter plot -> {out_path}")
+    return out_path
+
+
+def render_gnss_timeseries_plot(
+    matches: list[StationMatch],
+    out_path: Path,
+    *,
+    ts_station: GnssStation | None = None,
+    ts_gnss_dates: list[date] | None = None,
+    ts_gnss_los_mm: list[float] | None = None,
+    ts_insar_dates: list[date] | None = None,
+    ts_insar_los_mm: list[float] | None = None,
+    dpi: int = 300,
+) -> Path:
+    """Render standalone cumulative LOS displacement time-series overlay (or residual bars)."""
+    plots_dir = Path(__file__).resolve().parent / "plots"
+    if str(plots_dir) not in sys.path:
+        sys.path.insert(0, str(plots_dir))
+    from _common import save_figure  # noqa: E402
+    import matplotlib.dates as mdates  # noqa: E402
+    from matplotlib.ticker import MultipleLocator  # noqa: E402
+
+    plt = _configure_scientific_matplotlib()
+    fig, ax = plt.subplots(figsize=(6.8, 4.1))
+
     if (
         ts_station is not None
         and ts_gnss_dates
@@ -951,73 +1039,134 @@ def render_gnss_benchmark_plot(
         and ts_insar_dates
         and ts_insar_los_mm
     ):
-        ax_c.scatter(
-            ts_gnss_dates, ts_gnss_los_mm, s=13, color="#1D5B8F", alpha=0.55,
-            label=f"UNR Daily GNSS {ts_station.station_id} (projected LOS)", zorder=4,
+        ax.axhline(0.0, color="0.55", linestyle="--", linewidth=0.8, zorder=1)
+        ax.scatter(
+            ts_gnss_dates, ts_gnss_los_mm, s=15, color="#1f77b4", alpha=0.65,
+            edgecolors="none", zorder=3, label=f"UNR daily GNSS ({ts_station.station_id})",
         )
-        ax_c.plot(
-            ts_insar_dates, ts_insar_los_mm, "-o", color="#B8332A", linewidth=2.0, markersize=4.2,
-            markeredgecolor="#FFFFFF", markeredgewidth=0.6,
-            label="Sentinel-1 InSAR Cumulative LOS (6-day cadence)", zorder=6,
+        ax.plot(
+            ts_insar_dates, ts_insar_los_mm, "-o", color="#d62728", linewidth=1.6, markersize=4.3,
+            markeredgecolor="black", markeredgewidth=0.45, zorder=5,
+            label=f"Sentinel-1 InSAR ({ts_station.station_id})",
         )
-        ax_c.axhline(0.0, color="#9CA3AF", linestyle=":", linewidth=0.9)
-        ax_c.xaxis.set_major_locator(mdates.MonthLocator())
-        ax_c.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
-        ax_c.grid(True, alpha=0.55)
-        ax_c.set_ylabel("Cumulative LOS Displacement (mm)")
-        ax_c.set_xlabel("2026 Observation Date")
-        ax_c.set_title(
-            f"C. Live 2026 Time-Series Overlay at {ts_station.station_id} (Mexico City Airport)",
-            loc="left", pad=8,
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_minor_locator(mdates.DayLocator(bymonthday=[15]))
+        ax.yaxis.set_major_locator(MultipleLocator(20))
+        ax.set_axisbelow(True)
+        ax.grid(True, linestyle=":", linewidth=0.6, color="0.80")
+        ax.tick_params(direction="in", top=True, right=True, length=4.0, width=0.8)
+        ax.tick_params(which="minor", direction="in", top=True, right=True, length=2.2, width=0.6)
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Cumulative LOS displacement (mm)")
+        ax.legend(
+            loc="lower left", fontsize=8.5,
+            frameon=True, fancybox=False, edgecolor="0.65", facecolor="white", framealpha=0.95,
         )
-        if ts_rmse_mm is not None:
-            ax_c.text(
-                0.97, 0.94,
-                f"Epoch RMSE = {ts_rmse_mm:.1f} mm\n{len(ts_insar_dates)} SAR epochs · {len(ts_gnss_dates)} GNSS days",
-                transform=ax_c.transAxes,
-                fontsize=8.0, family="monospace", color=INK, va="top", ha="right",
-                bbox={"boxstyle": "round,pad=0.4", "facecolor": "#F8F7F4", "edgecolor": "#C8D0DA", "alpha": 0.95},
-                zorder=10,
-            )
-        ax_c.legend(loc="lower left", fontsize=8.0, frameon=True, facecolor="#FFFFFF", framealpha=0.9, edgecolor="#D5DCE4")
     else:
         ids = [m.station_id for m in matches]
         x_idx = np.arange(len(ids))
         res_up = [m.residual_mm_yr for m in matches]
-        if baseline_metrics is not None and any(m.baseline_residual_mm_yr is not None for m in matches):
+        if any(m.baseline_residual_mm_yr is not None for m in matches):
             res_base = [m.baseline_residual_mm_yr or 0.0 for m in matches]
-            ax_c.bar(x_idx - 0.18, res_base, width=0.35, color="#CBD5E1", edgecolor="#64748B", label="Baseline residual")
-            ax_c.bar(x_idx + 0.18, res_up, width=0.35, color="#B8332A", label="Upgraded residual")
+            ax.bar(x_idx - 0.18, res_base, width=0.35, color="0.75", edgecolor="0.4", label="Baseline residual")
+            ax.bar(x_idx + 0.18, res_up, width=0.35, color="#c0392b", edgecolor="black", linewidth=0.6, label="InSAR stack residual")
         else:
-            ax_c.bar(x_idx, res_up, width=0.5, color="#1D5B8F", label="InSAR − GNSS residual")
-        ax_c.axhline(0.0, color=INK, linewidth=0.9)
-        ax_c.set_xticks(x_idx)
-        ax_c.set_xticklabels(ids, fontweight="bold")
-        ax_c.set_ylabel("Velocity Residual (mm/yr)")
-        ax_c.set_title("C. Per-Station Velocity Residuals (InSAR − UNR GNSS)", loc="left", pad=8)
-        ax_c.grid(axis="y", alpha=0.55)
-        ax_c.legend(loc="best", fontsize=8.0)
+            ax.bar(x_idx, res_up, width=0.5, color="#1f77b4", edgecolor="black", linewidth=0.6, label="InSAR − GNSS")
+        ax.axhline(0.0, color="black", linewidth=0.8)
+        ax.set_xticks(x_idx)
+        ax.set_xticklabels(ids)
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", linestyle=":", linewidth=0.6, color="0.80")
+        ax.tick_params(direction="in", top=True, right=True, length=4.0, width=0.8)
+        ax.set_ylabel("Velocity residual (mm/yr)")
+        ax.legend(loc="best", fontsize=8.5, frameon=True, fancybox=False, edgecolor="0.65", facecolor="white")
 
-    title = f"GNSS Ground-Truth Benchmark — {format_site_label(stack_dir, ledger)}"
-    dem_used = summary.get("ramp_removal", {}).get("dem_applied", False)
-    ref_used = summary.get("reference_region", {}).get("applied", False)
-    subtitle = (
-        f"{format_date_range(ledger, summary)}  ·  "
-        f"Copernicus GLO-30 DEM Tropo: {'ON' if dem_used else 'OFF'}  ·  "
-        f"Bedrock Reference Pin: {'ON' if ref_used else 'OFF'}"
-    )
-    add_editorial_header(fig, title, subtitle, left=0.055, top=0.962)
-    add_footer(
-        fig,
-        "Ground truth: Nevada Geodetic Laboratory (UNR) North-America-fixed (NA) GNSS velocities & daily IGS20 .tenv3 positions projected onto exact Sentinel-1 zero-Doppler LOS.",
-        left=0.055,
-        bottom=0.012,
-    )
-
+    fig.tight_layout()
     save_figure(fig, out_path, dpi=dpi)
     plt.close(fig)
-    print(f"Saved GNSS validation benchmark plot -> {out_path}")
+    print(f"Saved GNSS time-series plot -> {out_path}")
     return out_path
+
+
+def render_gnss_validation_figures(
+    *,
+    stack_dir: Path,
+    matches: list[StationMatch],
+    ref_lonlat: tuple[float, float] | None = None,
+    insar_sign: float = -1.0,
+    ts_station: GnssStation | None = None,
+    ts_gnss_dates: list[date] | None = None,
+    ts_gnss_los_mm: list[float] | None = None,
+    ts_insar_dates: list[date] | None = None,
+    ts_insar_los_mm: list[float] | None = None,
+    map_out: Path | None = None,
+    scatter_out: Path | None = None,
+    timeseries_out: Path | None = None,
+    plots_dir: Path | None = None,
+    plot_prefix: str = "gnss_validation",
+    plot_out: Path | None = None,
+    dpi: int = 300,
+) -> list[Path]:
+    """Render requested standalone GNSS validation figures (map, scatter, time series)."""
+    if plots_dir is not None:
+        map_out = map_out or (plots_dir / f"{plot_prefix}_map.png")
+        scatter_out = scatter_out or (plots_dir / f"{plot_prefix}_scatter.png")
+        timeseries_out = timeseries_out or (plots_dir / f"{plot_prefix}_timeseries.png")
+    elif plot_out is not None and not any([map_out, scatter_out, timeseries_out]):
+        stem = plot_out.stem
+        parent = plot_out.parent
+        suffix = plot_out.suffix or ".png"
+        map_out = parent / f"{stem}_map{suffix}"
+        scatter_out = parent / f"{stem}_scatter{suffix}"
+        timeseries_out = parent / f"{stem}_timeseries{suffix}"
+
+    written: list[Path] = []
+    if map_out is not None:
+        written.append(
+            render_gnss_velocity_map(
+                stack_dir=stack_dir,
+                matches=matches,
+                out_path=map_out,
+                ref_lonlat=ref_lonlat,
+                insar_sign=insar_sign,
+                dpi=dpi,
+            )
+        )
+    if scatter_out is not None:
+        written.append(
+            render_gnss_scatter_plot(
+                matches=matches,
+                out_path=scatter_out,
+                dpi=dpi,
+            )
+        )
+    if timeseries_out is not None:
+        written.append(
+            render_gnss_timeseries_plot(
+                matches=matches,
+                out_path=timeseries_out,
+                ts_station=ts_station,
+                ts_gnss_dates=ts_gnss_dates,
+                ts_gnss_los_mm=ts_gnss_los_mm,
+                ts_insar_dates=ts_insar_dates,
+                ts_insar_los_mm=ts_insar_los_mm,
+                dpi=dpi,
+            )
+        )
+    return written
+
+
+def _load_baseline_from_csv(csv_path: Path) -> dict[str, float]:
+    """Load precomputed baseline InSAR LOS velocities keyed by station_id from a validation CSV."""
+    baseline_by_id: dict[str, float] = {}
+    with open(csv_path, "r", encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh):
+            sid = (row.get("station_id") or "").strip()
+            raw_val = (row.get("baseline_insar_los_mm_yr") or "").strip()
+            if sid and raw_val:
+                baseline_by_id[sid] = float(raw_val)
+    return baseline_by_id
 
 
 def validate_stack_against_gnss(
@@ -1034,13 +1183,20 @@ def validate_stack_against_gnss(
     insar_sign: float = -1.0,
     fetch_missing: bool = False,
     baseline_stack_dir: Path | None = None,
+    baseline_csv: Path | None = None,
     products_dir: Path | None = None,
     dem_path: Path | None = None,
     out_json: Path | None = None,
     out_csv: Path | None = None,
     plot_out: Path | None = None,
+    map_out: Path | None = None,
+    scatter_out: Path | None = None,
+    timeseries_out: Path | None = None,
+    plots_dir: Path | None = None,
+    plot_prefix: str = "gnss_validation",
+    dpi: int = 300,
 ) -> dict[str, Any]:
-    """Run full InSAR-vs-GNSS validation and optionally render the benchmark figure."""
+    """Run full InSAR-vs-GNSS validation and optionally render standalone matplotlib figures."""
     from osgeo import gdal, osr  # type: ignore
 
     gdal.UseExceptions()
@@ -1072,6 +1228,7 @@ def validate_stack_against_gnss(
         bcds = gdal.Open(str(baseline_stack_dir / "temporal_coherence.tif"))
         base_coh = bcds.GetRasterBand(1).ReadAsArray().astype(np.float64)
         bcds = None
+    baseline_by_id = _load_baseline_from_csv(baseline_csv) if (base_vel is None and baseline_csv is not None and baseline_csv.is_file()) else {}
 
     src_wgs = osr.SpatialReference()
     src_wgs.ImportFromEPSG(4326)
@@ -1159,6 +1316,9 @@ def validate_stack_against_gnss(
             if bs is not None:
                 base_los = insar_sign * bs[0]
                 base_res = base_los - gnss_los
+        elif st.station_id in baseline_by_id:
+            base_los = baseline_by_id[st.station_id]
+            base_res = base_los - gnss_los
 
         matches.append(
             StationMatch(
@@ -1302,13 +1462,10 @@ def validate_stack_against_gnss(
                 w_csv.writerow(asdict(m))
         print(f"Wrote GNSS validation CSV -> {out_csv}")
 
-    if plot_out is not None:
-        render_gnss_benchmark_plot(
+    if any(p is not None for p in (map_out, scatter_out, timeseries_out, plots_dir, plot_out)):
+        render_gnss_validation_figures(
             stack_dir=stack_dir,
             matches=matches,
-            metrics=metrics,
-            out_path=plot_out,
-            baseline_metrics=baseline_metrics,
             ref_lonlat=ref_lonlat,
             insar_sign=insar_sign,
             ts_station=ts_station,
@@ -1316,7 +1473,13 @@ def validate_stack_against_gnss(
             ts_gnss_los_mm=ts_gnss_los_mm,
             ts_insar_dates=ts_insar_dates,
             ts_insar_los_mm=ts_insar_los_mm,
-            ts_rmse_mm=ts_rmse_mm,
+            map_out=map_out,
+            scatter_out=scatter_out,
+            timeseries_out=timeseries_out,
+            plots_dir=plots_dir,
+            plot_prefix=plot_prefix,
+            plot_out=plot_out,
+            dpi=dpi,
         )
 
     return report
@@ -1326,6 +1489,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Validate InSAR stack velocity against UNR/NGL GNSS ground truth.")
     p.add_argument("--stack-dir", required=True, type=Path, help="Stack directory with velocity_mm_yr.tif and temporal_coherence.tif")
     p.add_argument("--baseline-stack-dir", type=Path, default=None, help="Optional baseline stack dir for before/after comparison")
+    p.add_argument("--baseline-csv", type=Path, default=None, help="Optional validation CSV with baseline_insar_los_mm_yr column")
     p.add_argument("--products-dir", type=Path, default=None, help="Optional pair products dir for 2026 cumulative time-series overlay")
     p.add_argument("--dem", type=Path, default=None, help="Optional aligned DEM GeoTIFF used during time-series overlay")
     p.add_argument("--gnss-cache-dir", type=Path, default=Path("insar_work/gnss/unr"), help="Directory with UNR DataHoldings.txt, midas.NA.txt, *.NA.tenv3")
@@ -1338,7 +1502,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch-missing", action="store_true", help="Download missing UNR files if not cached locally")
     p.add_argument("--out-json", type=Path, default=None, help="Output validation metrics JSON path")
     p.add_argument("--out-csv", type=Path, default=None, help="Output per-station comparison CSV path")
-    p.add_argument("--plot-out", type=Path, default=None, help="Output publication-grade PNG benchmark plot path")
+    p.add_argument("--plot-out", type=Path, default=None, help="Base output path to emit separate *_map, *_scatter, *_timeseries PNGs")
+    p.add_argument("--plots-dir", type=Path, default=None, help="Directory to write separate map, scatter, and timeseries PNGs")
+    p.add_argument("--plot-prefix", type=str, default="gnss_validation", help="Filename prefix when using --plots-dir")
+    p.add_argument("--map-out", type=Path, default=None, help="Output path for standalone velocity map figure")
+    p.add_argument("--scatter-out", type=Path, default=None, help="Output path for standalone 1:1 scatter figure")
+    p.add_argument("--timeseries-out", type=Path, default=None, help="Output path for standalone time-series figure")
+    p.add_argument("--dpi", type=int, default=300, help="Figure output resolution in DPI (default: 300)")
     return p
 
 
@@ -1356,11 +1526,18 @@ def main(argv: list[str] | None = None) -> int:
         min_coh=args.min_coh,
         fetch_missing=args.fetch_missing,
         baseline_stack_dir=args.baseline_stack_dir,
+        baseline_csv=args.baseline_csv,
         products_dir=args.products_dir,
         dem_path=args.dem,
         out_json=args.out_json,
         out_csv=args.out_csv,
         plot_out=args.plot_out,
+        map_out=args.map_out,
+        scatter_out=args.scatter_out,
+        timeseries_out=args.timeseries_out,
+        plots_dir=args.plots_dir,
+        plot_prefix=args.plot_prefix,
+        dpi=args.dpi,
     )
     print("\nGNSS Validation Summary:")
     print(json.dumps(report["metrics"], indent=2))
