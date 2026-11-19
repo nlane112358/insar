@@ -1,178 +1,82 @@
 # insar-cpu-proto
 
-This project is a high-performance, native C++20 InSAR (Interferometric Synthetic Aperture Radar) processing engine designed to convert satellite radar observations into millimeter-scale ground-deformation measurements at near real-time speeds. Its core goal is to replace slow, batch-oriented academic InSAR scripts with a memory-resident, GPU-accelerated computational engine capable of continuous, corridor- and country-scale infrastructure monitoring.
+Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stacking engine for Sentinel-1 (OPERA CSLC-S1) and NISAR (L-band GSLC) radar imagery. Converts coregistered complex pairs into millimeter-scale line-of-sight (LOS) deformation rasters, Cloud-Optimized GeoTIFFs, and linear infrastructure corridor risk alerts.
+
+---
+
+## Outputs
+
+### Mexico City — Sentinel-1 C-Band Sequential Stack (`T041_086877_IW1`)
+
+![Line-of-Sight Surface Velocity — Mexico City IW1](docs/figures/mexico_city_iw1_velocity_map.png)
+
+*24 consecutive OPERA CSLC-S1 pairs (19 Jun – 17 Nov 2026, 145 stacked days), order-1 coherence-weighted Huber IRLS ramp removal, coherence-modulated shading, and 100 m buffered Metro, Rail, and Motorway corridor overlays.*
+
+### West Yorkshire — NISAR L-Band (`NISAR_T052_F061_D`)
+
+<p align="center">
+  <img src="docs/figures/west_yorkshire_t052_velocity_map.png" alt="Line-of-Sight Surface Velocity — West Yorkshire T052" width="640" />
+</p>
+
+*12-day L-band NISAR GSLC pair (27 Oct – 08 Nov 2026) over Huddersfield and the Holme Valley with buffered Canal, Rail, Motorway, River, Dam, and Reservoir corridors.*
+
+### Single-Pair Diagnostics (`insar_proto`)
 
 ![NISAR InSAR Output Preview](nisar_preview.png)
 
-*Left to right (`NISAR_T052_F061_D_2026-10-27_2026-11-08`): (1) wrapped interferometric phase $\psi \in [-\pi, \pi]$ (rad), (2) estimated coherence $\gamma \in [0, 1]$, and (3) unwrapped line-of-sight (LOS) displacement (mm) with detected high-coherence anomaly alerts overlaid (`Alerts (17)`).*
+*Pair-level outputs for `NISAR_T052_F061_D_2026-10-27_2026-11-08`: wrapped interferometric phase $\psi \in [-\pi, \pi]$, spatial coherence $\gamma \in [0, 1]$, and unwrapped LOS displacement (mm) with high-coherence anomaly alerts.*
 
 ---
 
-## Why This Project Exists
+## Architecture
 
-Satellite radar coverage has expanded sharply in 2026. ESA's Sentinel-1D opened user data in April 2026 and became fully operational in May 2026, orbiting 180° apart in tandem with Sentinel-1C for rapid global C-band revisits. Alongside it, the NASA–ISRO NISAR mission was declared fully operational in January 2026, delivering open L-band and S-band SAR imagery on a 12-day exact repeat cycle that penetrates vegetation canopies where C-band radar loses coherence.
-
-Despite this surge in free, high-cadence radar data, most operational InSAR pipelines still rely on legacy CPU tools (such as SNAP, SNAPHU, StaMPS, and MintPy) stitched together with Python wrappers and intermediate disk files. Those stacks frequently take 30–60 minutes to unwrap a single swath and reprocess entire historical stacks whenever a new satellite pass arrives—making continuous monitoring across national rail networks, pipelines, water utilities, or mines prohibitively slow and expensive.
-
----
-
-## Technical Approach & What v0.1 Implements
-
-The v0.1 prototype validates the core mathematical and systems foundation: fusing interferogram formation, coherence estimation, and coherence-weighted 2D phase unwrapping inside persistent memory buffers without intermediate disk I/O. It currently exists in two mathematically identical backends:
-
-- **Local CPU Prototype ([`include/insar/`](include/insar), [`src/engine/cpu_insar_engine.cpp`](src/engine/cpu_insar_engine.cpp)):** A zero-dependency C++20 + OpenMP implementation featuring a built-in, cache-blocked, multithreaded 2D radix-2 FFT. It runs locally on any standard laptop or workstation to verify millimeter-level accuracy and establish a clean CPU runtime baseline.
-- **GPU Prototype (`insar_engine.cu`):** A C++20 + CUDA / cuFFT implementation that keeps complex radar tiles, coherence weights, and iterative solver vectors resident in GPU VRAM to eliminate PCIe and storage bottlenecks.
-
-### Core Pipeline Inside v0.1
-
-- **Fused Interferogram & Coherence Estimation:** Computes complex cross-multiplication ($S_1 \cdot S_2^*$), wrapped interferometric phase, and $7 \times 7$ spatial coherence in a single memory pass.
-- **Coherence-Weighted PCG Phase Unwrapping:** Solves the weighted least-squares phase unwrapping problem using Preconditioned Conjugate Gradient (PCG), preconditioned by an exact half-sample mirrored 2D FFT Neumann Poisson solver. Edge weights scale cubically with coherence ($\gamma^3$), routing phase integration around decorrelated regions (such as water bodies or dense forests) so noise does not corrupt nearby subsidence signals.
-- **Verification & Visualization Harness:** Includes a built-in Sentinel-1 C-band synthetic radar generator (complete with circular complex Gaussian speckle, multi-fringe subsidence bowls, and a decorrelated lake/forest patch), raw complex float32 file hooks (`--slc1`, `--slc2`), automatic line-of-sight RMSE calculation in millimeters, and a Python plotting utility ([`scripts/inspect_output.py`](scripts/inspect_output.py)).
-
----
-
-## Prototype vs. Production Engine Scope
-
-| Capability | Current v0.1 Prototype | Target Commercial Engine |
+| Component | Path | Role |
 | :--- | :--- | :--- |
-| **Compute Backends** | Standalone C++20/OpenMP CPU and CUDA/cuFFT GPU | Unified backend abstraction with out-of-core VRAM tiling (full 250 km swaths in 8 GB VRAM) |
-| **Data Ingestion** | Built-in synthetic C-band generator + raw binary complex float32 | Native GDAL/HDF5 streaming for Sentinel-1 IW SLC, NISAR L-band, and commercial X-band (ICEYE, Capella, Umbra) |
-| **Preprocessing** | Assumes pre-coregistered complex pairs | GPU Range-Doppler coregistration, Enhanced Spectral Diversity (ESD), and baseline-version guardrails |
-| **Denoising** | $7 \times 7$ boxcar multilooking | Adaptive Goldstein or tiled nonlocal InSAR-BM3D filtering to preserve sharp fringe gradients |
-| **Time Series** | Single interferometric pair | Sequential (online) PS/DS updating ($O(1)$ append per new satellite pass) + ascending/descending vertical-vs-horizontal decomposition |
-| **Outputs** | Binary `.f32` rasters + terminal benchmark metrics | Cloud-native GeoParquet / PostGIS feeds and automated velocity-acceleration alerts pinned to vector assets |
+| **Pair Engine** | [`src/engine/`](src/engine) · `insar_proto` | Fused boxcar interferogram & coherence, $\gamma^3$-weighted PCG phase unwrapping with exact mirrored-2D-FFT Neumann preconditioner, COG + STAC + alert export |
+| **Online Stacker** | [`src/insar_stack_cpu.cpp`](src/insar_stack_cpu.cpp) · `insar_stack` | $O(1)$ per-pass updates to a 13-band Float64 sufficient-statistics raster (`stack_state.tif`), Huber IRLS ramp removal, velocity/uncertainty/acceleration COGs, buffered corridor risk analytics |
+| **Ingestion** | [`scripts/auto_ingest.py`](scripts/auto_ingest.py) | Automated Sentinel-1 OPERA & NISAR L-band discovery, SQLite state tracking, and pair execution |
+| **Stack Runner** | [`scripts/stack_timeseries.py`](scripts/stack_timeseries.py) | Chronological pair-chain discovery, incremental `insar_stack` dispatch, ledger & corridor timeseries management |
+| **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) | Standalone publication maps for `velocity`, `cumulative`, `coherence`, `uncertainty`, and `acceleration` layers |
+| **HTTP API** | [`api/server.py`](api/server.py) | FastAPI asynchronous job runner and artifact server wrapping `insar_proto` |
 
 ---
 
-## Commercial Vision
+## Quickstart
 
-Because the engine's moat lies in compute efficiency, multi-sensor fusion (C-band + L-band), and incremental time-series updating, it supports two distinct go-to-market models:
-
-- **OEM Engine / API Licensing:** Licensing the C++/GPU binary or cloud API to commercial SAR constellation operators, geotechnical consultancies, and infrastructure insurers who want to power continuous subsidence monitoring without building an internal HPC radar team.
-- **Vertical Linear-Asset Monitoring SaaS:** Focusing on a high-liability vertical—such as mining tailings dams, rail embankments, or buried water and gas networks—to act as a continuous, network-wide early-warning triage layer that flags sudden ground-movement acceleration for field engineers.
-
----
-
-## Mathematical Formulation
-
-### 1. Interferogram & Coherence Estimation
-
-Given two co-registered Single Look Complex (SLC) images $s_1, s_2 \in \mathbb{C}^{H \times W}$ and a $(2r+1)\times(2r+1)$ boxcar window $\mathcal{N}_r(x,y)$ (default $r=3$, i.e., $7\times 7$), the multi-looked complex interferogram is:
-
-$$
-C(x, y) = \sum_{(i, j) \in \mathcal{N}_r(x, y)} s_1(i, j) s_2^*(i, j)
-$$
-
-The **wrapped interferometric phase** $\psi(x, y)$ and **sample coherence magnitude** $\gamma(x, y)$ are:
-
-$$
-\psi(x, y) = \mathrm{atan2}\big(\mathrm{Im}(C(x, y)), \mathrm{Re}(C(x, y))\big) \in [-\pi, \pi]
-$$
-
-$$
-\gamma(x, y) = \mathrm{clip}\left(\frac{|C(x, y)|}{\sqrt{\left(\sum_{\mathcal{N}_r} |s_1|^2\right)\left(\sum_{\mathcal{N}_r} |s_2|^2\right)} + \varepsilon}, 0, 1\right), \quad \varepsilon = 10^{-12}
-$$
-
----
-
-### 2. Coherence-Weighted Least-Squares Phase Unwrapping
-
-On the 4-connected pixel grid, define edge weights and wrapped forward phase differences with $w_{\min} = 10^{-4}$:
-
-$$
-w_x(x, y) = \max\Big(w_{\min}, \min\big(\gamma(x, y), \gamma(x+1, y)\big)^3\Big), \qquad \Delta_x(x, y) = \mathcal{W}\big(\psi(x+1, y) - \psi(x, y)\big)
-$$
-
-$$
-w_y(x, y) = \max\Big(w_{\min}, \min\big(\gamma(x, y), \gamma(x, y+1)\big)^3\Big), \qquad \Delta_y(x, y) = \mathcal{W}\big(\psi(x, y+1) - \psi(x, y)\big)
-$$
-
-where the wrapping operator maps phase differences onto $[-\pi, \pi)$:
-
-$$
-\mathcal{W}(d) = \big((d + \pi) \bmod 2\pi\big) - \pi
-$$
-
-Phase unwrapping finds $\phi \in \mathbb{R}^{H \times W}$ minimizing the weighted gradient mismatch:
-
-$$
-\min_{\phi} \frac{1}{2} \sum_{y=0}^{H-1} \sum_{x=0}^{W-2} w_x(x, y)\big(\phi(x+1, y) - \phi(x, y) - \Delta_x(x, y)\big)^2 + \frac{1}{2} \sum_{y=0}^{H-2} \sum_{x=0}^{W-1} w_y(x, y)\big(\phi(x, y+1) - \phi(x, y) - \Delta_y(x, y)\big)^2
-$$
-
-Setting $\nabla_\phi J = 0$ yields the symmetric positive semi-definite linear system $L_w \phi = b$:
-
-$$
-(L_w \phi)(x, y) = w_x(x, y)\big(\phi(x, y) - \phi(x+1, y)\big) + w_x(x-1, y)\big(\phi(x, y) - \phi(x-1, y)\big) + w_y(x, y)\big(\phi(x, y) - \phi(x, y+1)\big) + w_y(x, y-1)\big(\phi(x, y) - \phi(x, y-1)\big)
-$$
-
-$$
-b(x, y) = \big(w_x(x-1, y)\Delta_x(x-1, y) - w_x(x, y)\Delta_x(x, y)\big) + \big(w_y(x, y-1)\Delta_y(x, y-1) - w_y(x, y)\Delta_y(x, y)\big)
-$$
-
-with out-of-bounds edge weights set to $0$ (homogeneous Neumann boundary conditions).
-
----
-
-### 3. Exact Neumann Poisson Preconditioner via Mirrored 2D FFT
-
-The system $L_w \phi = b$ is solved with **Preconditioned Conjugate Gradient (PCG)** using the unweighted 2D discrete Neumann Laplacian $L$ as preconditioner ($M^{-1} r = L^+ r$).
-
-To enforce homogeneous Neumann boundaries exactly with a radix-2 FFT, the residual $r \in \mathbb{R}^{H \times W}$ is half-sample mirror-padded to size $M_H \times M_W = 2H \times 2W$:
-
-$$
-\tilde{r}(x, y) = \tilde{r}(2W - 1 - x, y) = \tilde{r}(x, 2H - 1 - y) = \tilde{r}(2W - 1 - x, 2H - 1 - y) = r(x, y)
-$$
-
-for $0 \le x < W$ and $0 \le y < H$. Taking the 2D DFT $\widehat{R} = \mathcal{F}_{2\text{D}}(\tilde{r})$ diagonalizes the discrete 5-point Neumann Laplacian, giving the spectral divide:
-
-$$
-\widehat{Z}(0, 0) = 0, \qquad \widehat{Z}(k_x, k_y) = \frac{\widehat{R}(k_x, k_y)}{4 - 2\cos\left(\frac{\pi k_x}{W}\right) - 2\cos\left(\frac{\pi k_y}{H}\right)} \quad \big((k_x, k_y) \neq (0, 0)\big)
-$$
-
-The preconditioned vector $z$ is obtained by taking the real part of the top-left $H \times W$ quadrant of $\frac{1}{M_W M_H} \mathcal{F}_{2\text{D}}^{-1}(\widehat{Z})$.
-
----
-
-### 4. Phase-to-LOS Conversion & Synthetic Test Scene
-
-For Sentinel-1 C-band ($\lambda = 55.4658\text{ mm}$), two-way line-of-sight displacement $d_{\text{LOS}}$ relates to interferometric phase $\phi$ by:
-
-$$
-\phi = \frac{4\pi}{\lambda} d_{\text{LOS}}, \qquad d_{\text{LOS}} = \frac{\lambda}{4\pi} \phi
-$$
-
-where one full $2\pi$ fringe corresponds to $\lambda / 2 \approx 27.73\text{ mm}$ of LOS motion.
-
-In normalized coordinates $x_n = x/W - 0.5$ and $y_n = y/H - 0.5$, the built-in synthetic scene generates:
-
-$$
-d_{\text{LOS}}(x_n, y_n) = -95 e^{-r_1} - 40 e^{-r_2} + 12 x_n - 8 y_n \quad [\text{mm}]
-$$
-
-$$
-r_1 = \frac{(x_n + 0.12)^2}{0.018} + \frac{(y_n - 0.05)^2}{0.014}, \qquad r_2 = \frac{(x_n - 0.20)^2}{0.008} + \frac{(y_n + 0.18)^2}{0.010}
-$$
-
-with a simulated decorrelated region where true coherence $\rho = 0.15$ inside $\frac{(x_n - 0.15)^2 + (y_n + 0.15)^2}{0.012} < 1$ and $\rho = 0.90$ elsewhere:
-
-$$
-s_1 = a_{\text{re}} + i a_{\text{im}}, \qquad s_2 = \rho s_1 e^{-i\phi} + \sqrt{1 - \rho^2}(n_{\text{re}} + i n_{\text{im}}), \qquad a_{\text{re}}, a_{\text{im}}, n_{\text{re}}, n_{\text{im}} \sim \mathcal{N}(0, 1)
-$$
-
----
-
-## Build & Run
+**Prerequisites:** CMake $\ge$ 3.18, a C++20 compiler (OpenMP optional), GDAL, and Python 3 with `numpy`, `matplotlib`, and `osgeo` for plotting.
 
 ```bash
+# Build C++ binaries and tests
 cmake -B build
-cmake --build build
-./build/insar_proto --dump
-python3 scripts/inspect_output.py
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-### CLI Options
+```bash
+# 1. Run a synthetic or real interferometric pair -> COGs + alerts.geojson
+./build/insar_proto --out-dir out_synth
+./build/insar_proto --slc1 ref.h5 --slc2 sec.h5 --out-dir out_pair
 
-- `--width <N>` / `--height <N>`: Raster dimensions (must be powers of 2; default `1024 x 1024`)
-- `--iters <N>`: Maximum PCG iterations (default `35`, tolerance `1e-4`)
-- `--slc1 <path>` / `--slc2 <path>`: Optional raw `complex<float>` (`complex64`) binary SLC inputs
-- `--dump`: Write `wrapped_phase.f32`, `coherence.f32`, `unwrapped_phase.f32` (and `true_phase.f32` for synthetic runs)
+# 2. Incrementally update a multi-pass stack + corridor analytics
+python3 scripts/stack_timeseries.py \
+  --products-dir insar_work/products \
+  --out-dir insar_work/stacks/mexico_city_iw1 \
+  --corridors data/corridors/mexico_city_corridors.geojson
+
+# 3. Render a cartographic raster map
+python3 scripts/plots/plot_raster_map.py \
+  --stack-dir insar_work/stacks/mexico_city_iw1 \
+  --layer velocity
+```
+
+---
+
+<details>
+<summary><strong>Method & Mathematical Summary</strong></summary>
+
+1. **Interferogram & Coherence:** For coregistered SLCs $s_1, s_2$ over a $(2r_x+1)\times(2r_y+1)$ window $\mathcal{N}$, $C = \sum_{\mathcal{N}} s_1 s_2^*$, wrapped phase $\psi = \operatorname{atan2}(\operatorname{Im} C, \operatorname{Re} C)$, and coherence $\gamma = |C| / \big(\sqrt{\sum_{\mathcal{N}} |s_1|^2 \sum_{\mathcal{N}} |s_2|^2} + \varepsilon\big)$.
+2. **Coherence-Weighted Unwrapping:** Minimizes $\frac{1}{2}\sum_e w_e (\nabla_e \phi - \mathcal{W}(\nabla_e \psi))^2$ with cubic edge weights $w_e = \max(10^{-4}, \min(\gamma_u, \gamma_v)^3)$ via Preconditioned Conjugate Gradient (PCG), preconditioned by an exact half-sample mirrored 2D radix-2 FFT Neumann Poisson solver.
+3. **LOS Displacement:** $d_{\text{LOS}} = \frac{\lambda}{4\pi}\phi$, parameterized per sensor ($\lambda = 55.4658\text{ mm}$ for Sentinel-1 C-band; dynamic HDF5 wavelength $\approx 238.4\text{ mm}$ for NISAR L-band).
+4. **Sequential $O(1)$ Stacking:** After order-$k$ coherence-weighted Huber IRLS ramp removal, each new interferogram updates a persistent 13-band Float64 normal-equation state (`stack_state.tif`) in constant time per pass, yielding exact least-squares velocity, velocity standard error, acceleration, cumulative displacement, and temporal coherence without reprocessing history.
+
+</details>
