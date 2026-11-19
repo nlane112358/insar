@@ -4,9 +4,9 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = 
 
-CXX_INCLUDES = -isystem /opt/homebrew/opt/libomp/include
+CXX_INCLUDES = -isystem /opt/homebrew/include -isystem /opt/homebrew/opt/libomp/include
 
-CXX_FLAGSarm64 = -std=gnu++20 -arch arm64 -O3 -ffast-math -mcpu=native -Xclang -fopenmp
+CXX_FLAGSarm64 = -std=gnu++20 -arch arm64 -O3 -fno-math-errno -mcpu=native -Xclang -fopenmp
 
-CXX_FLAGS = -std=gnu++20 -arch arm64 -O3 -ffast-math -mcpu=native -Xclang -fopenmp
+CXX_FLAGS = -std=gnu++20 -arch arm64 -O3 -fno-math-errno -mcpu=native -Xclang -fopenmp
 

@@ -60,19 +60,17 @@ Because the engine's moat lies in compute efficiency, multi-sensor fusion (C-ban
 Given two co-registered Single Look Complex (SLC) images $s_1, s_2 \in \mathbb{C}^{H \times W}$ and a $(2r+1)\times(2r+1)$ boxcar window $\mathcal{N}_r(x,y)$ (default $r=3$, i.e., $7\times 7$), the multi-looked complex interferogram is:
 
 $$
-C(x, y) = \sum_{(i, j) \in \mathcal{N}_r(x, y)} s_1(i, j)\, s_2^*(i, j)
+C(x, y) = \sum_{(i, j) \in \mathcal{N}_r(x, y)} s_1(i, j) s_2^*(i, j)
 $$
 
 The **wrapped interferometric phase** $\psi(x, y)$ and **sample coherence magnitude** $\gamma(x, y)$ are:
 
 $$
-\psi(x, y) = \operatorname{atan2}\!\big(\operatorname{Im}\, C(x, y),\; \operatorname{Re}\, C(x, y)\big) \in [-\pi, \pi]
+\psi(x, y) = \mathrm{atan2}\big(\mathrm{Im}(C(x, y)), \mathrm{Re}(C(x, y))\big) \in [-\pi, \pi]
 $$
 
 $$
-\gamma(x, y) = \operatorname{clip}\!\left(
-\frac{|C(x, y)|}{\sqrt{\left(\sum_{\mathcal{N}_r} |s_1|^2\right)\left(\sum_{\mathcal{N}_r} |s_2|^2\right)} + \varepsilon},\; 0,\; 1
-\right), \quad \varepsilon = 10^{-12}
+\gamma(x, y) = \mathrm{clip}\left(\frac{|C(x, y)|}{\sqrt{\left(\sum_{\mathcal{N}_r} |s_1|^2\right)\left(\sum_{\mathcal{N}_r} |s_2|^2\right)} + \varepsilon}, 0, 1\right), \quad \varepsilon = 10^{-12}
 $$
 
 ---
@@ -82,13 +80,11 @@ $$
 On the 4-connected pixel grid, define edge weights and wrapped forward phase differences with $w_{\min} = 10^{-4}$:
 
 $$
-w_x(x, y) = \max\!\Big(w_{\min},\; \min\big(\gamma(x, y),\, \gamma(x+1, y)\big)^3\Big), \qquad
-\Delta_x(x, y) = \mathcal{W}\!\big(\psi(x+1, y) - \psi(x, y)\big)
+w_x(x, y) = \max\Big(w_{\min}, \min\big(\gamma(x, y), \gamma(x+1, y)\big)^3\Big), \qquad \Delta_x(x, y) = \mathcal{W}\big(\psi(x+1, y) - \psi(x, y)\big)
 $$
 
 $$
-w_y(x, y) = \max\!\Big(w_{\min},\; \min\big(\gamma(x, y),\, \gamma(x, y+1)\big)^3\Big), \qquad
-\Delta_y(x, y) = \mathcal{W}\!\big(\psi(x, y+1) - \psi(x, y)\big)
+w_y(x, y) = \max\Big(w_{\min}, \min\big(\gamma(x, y), \gamma(x, y+1)\big)^3\Big), \qquad \Delta_y(x, y) = \mathcal{W}\big(\psi(x, y+1) - \psi(x, y)\big)
 $$
 
 where the wrapping operator maps phase differences onto $[-\pi, \pi)$:
@@ -100,22 +96,17 @@ $$
 Phase unwrapping finds $\phi \in \mathbb{R}^{H \times W}$ minimizing the weighted gradient mismatch:
 
 $$
-\min_{\phi}\; \frac{1}{2} \sum_{y=0}^{H-1} \sum_{x=0}^{W-2} w_x(x, y)\big(\phi(x+1, y) - \phi(x, y) - \Delta_x(x, y)\big)^2
-+ \frac{1}{2} \sum_{y=0}^{H-2} \sum_{x=0}^{W-1} w_y(x, y)\big(\phi(x, y+1) - \phi(x, y) - \Delta_y(x, y)\big)^2
+\min_{\phi} \frac{1}{2} \sum_{y=0}^{H-1} \sum_{x=0}^{W-2} w_x(x, y)\big(\phi(x+1, y) - \phi(x, y) - \Delta_x(x, y)\big)^2 + \frac{1}{2} \sum_{y=0}^{H-2} \sum_{x=0}^{W-1} w_y(x, y)\big(\phi(x, y+1) - \phi(x, y) - \Delta_y(x, y)\big)^2
 $$
 
 Setting $\nabla_\phi J = 0$ yields the symmetric positive semi-definite linear system $L_w \phi = b$:
 
 $$
-\begin{aligned}
-\big(L_w \phi\big)(x, y) =\;& w_x(x, y)\big(\phi(x, y) - \phi(x+1, y)\big) + w_x(x-1, y)\big(\phi(x, y) - \phi(x-1, y)\big) \\
-+\;& w_y(x, y)\big(\phi(x, y) - \phi(x, y+1)\big) + w_y(x, y-1)\big(\phi(x, y) - \phi(x, y-1)\big)
-\end{aligned}
+(L_w \phi)(x, y) = w_x(x, y)\big(\phi(x, y) - \phi(x+1, y)\big) + w_x(x-1, y)\big(\phi(x, y) - \phi(x-1, y)\big) + w_y(x, y)\big(\phi(x, y) - \phi(x, y+1)\big) + w_y(x, y-1)\big(\phi(x, y) - \phi(x, y-1)\big)
 $$
 
 $$
-b(x, y) = \big(w_x(x-1, y)\,\Delta_x(x-1, y) - w_x(x, y)\,\Delta_x(x, y)\big)
-        + \big(w_y(x, y-1)\,\Delta_y(x, y-1) - w_y(x, y)\,\Delta_y(x, y)\big)
+b(x, y) = \big(w_x(x-1, y)\Delta_x(x-1, y) - w_x(x, y)\Delta_x(x, y)\big) + \big(w_y(x, y-1)\Delta_y(x, y-1) - w_y(x, y)\Delta_y(x, y)\big)
 $$
 
 with out-of-bounds edge weights set to $0$ (homogeneous Neumann boundary conditions).
@@ -132,17 +123,13 @@ $$
 \tilde{r}(x, y) = \tilde{r}(2W - 1 - x, y) = \tilde{r}(x, 2H - 1 - y) = \tilde{r}(2W - 1 - x, 2H - 1 - y) = r(x, y)
 $$
 
-for $0 \le x < W,\; 0 \le y < H$. Taking the 2D DFT $\widehat{R} = \mathcal{F}_{2\text{D}}\{\tilde{r}\}$ diagonalizes the discrete 5-point Neumann Laplacian, giving the spectral divide:
+for $0 \le x < W$ and $0 \le y < H$. Taking the 2D DFT $\widehat{R} = \mathcal{F}_{2\text{D}}(\tilde{r})$ diagonalizes the discrete 5-point Neumann Laplacian, giving the spectral divide:
 
 $$
-\widehat{Z}(k_x, k_y) =
-\begin{cases}
-0, & k_x = 0 \text{ and } k_y = 0 \\[6pt]
-\dfrac{\widehat{R}(k_x, k_y)}{4 - 2\cos\!\left(\dfrac{\pi k_x}{W}\right) - 2\cos\!\left(\dfrac{\pi k_y}{H}\right)}, & \text{otherwise}
-\end{cases}
+\widehat{Z}(0, 0) = 0, \qquad \widehat{Z}(k_x, k_y) = \frac{\widehat{R}(k_x, k_y)}{4 - 2\cos\left(\frac{\pi k_x}{W}\right) - 2\cos\left(\frac{\pi k_y}{H}\right)} \quad \big((k_x, k_y) \neq (0, 0)\big)
 $$
 
-The preconditioned vector $z$ is obtained by taking the real part of the top-left $H \times W$ quadrant of $\frac{1}{M_W M_H}\,\mathcal{F}_{2\text{D}}^{-1}\{\widehat{Z}\}$.
+The preconditioned vector $z$ is obtained by taking the real part of the top-left $H \times W$ quadrant of $\frac{1}{M_W M_H} \mathcal{F}_{2\text{D}}^{-1}(\widehat{Z})$.
 
 ---
 
@@ -151,28 +138,25 @@ The preconditioned vector $z$ is obtained by taking the real part of the top-lef
 For Sentinel-1 C-band ($\lambda = 55.4658\text{ mm}$), two-way line-of-sight displacement $d_{\text{LOS}}$ relates to interferometric phase $\phi$ by:
 
 $$
-\phi = \frac{4\pi}{\lambda}\, d_{\text{LOS}}, \qquad d_{\text{LOS}} = \frac{\lambda}{4\pi}\, \phi
+\phi = \frac{4\pi}{\lambda} d_{\text{LOS}}, \qquad d_{\text{LOS}} = \frac{\lambda}{4\pi} \phi
 $$
 
 where one full $2\pi$ fringe corresponds to $\lambda / 2 \approx 27.73\text{ mm}$ of LOS motion.
 
-In normalized coordinates $x_n = x/W - 0.5,\; y_n = y/H - 0.5$, the built-in synthetic scene generates:
+In normalized coordinates $x_n = x/W - 0.5$ and $y_n = y/H - 0.5$, the built-in synthetic scene generates:
 
 $$
-d_{\text{LOS}}(x_n, y_n) = -95\, e^{-r_1} - 40\, e^{-r_2} + 12\, x_n - 8\, y_n \quad [\text{mm}]
+d_{\text{LOS}}(x_n, y_n) = -95 e^{-r_1} - 40 e^{-r_2} + 12 x_n - 8 y_n \quad [\text{mm}]
 $$
 
 $$
-r_1 = \frac{(x_n + 0.12)^2}{0.018} + \frac{(y_n - 0.05)^2}{0.014}, \qquad
-r_2 = \frac{(x_n - 0.20)^2}{0.008} + \frac{(y_n + 0.18)^2}{0.010}
+r_1 = \frac{(x_n + 0.12)^2}{0.018} + \frac{(y_n - 0.05)^2}{0.014}, \qquad r_2 = \frac{(x_n - 0.20)^2}{0.008} + \frac{(y_n + 0.18)^2}{0.010}
 $$
 
 with a simulated decorrelated region where true coherence $\rho = 0.15$ inside $\frac{(x_n - 0.15)^2 + (y_n + 0.15)^2}{0.012} < 1$ and $\rho = 0.90$ elsewhere:
 
 $$
-s_1 = a_{\text{re}} + i\, a_{\text{im}}, \qquad
-s_2 = \rho\, s_1 e^{-i\phi} + \sqrt{1 - \rho^2}\,(n_{\text{re}} + i\, n_{\text{im}}), \qquad
-a_{\text{re}}, a_{\text{im}}, n_{\text{re}}, n_{\text{im}} \sim \mathcal{N}(0, 1)
+s_1 = a_{\text{re}} + i a_{\text{im}}, \qquad s_2 = \rho s_1 e^{-i\phi} + \sqrt{1 - \rho^2}(n_{\text{re}} + i n_{\text{im}}), \qquad a_{\text{re}}, a_{\text{im}}, n_{\text{re}}, n_{\text{im}} \sim \mathcal{N}(0, 1)
 $$
 
 ---

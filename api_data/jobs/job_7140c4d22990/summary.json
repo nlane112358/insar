@@ -1,0 +1,13 @@
+{
+  "width": 128,
+  "height": 128,
+  "valid_pixels": 16384,
+  "ifg_ms": 0.367375,
+  "unwrap_ms": 2.08371,
+  "processing_time_ms": 2.45108,
+  "iterations": 3,
+  "min_displacement_mm": -0.00164915,
+  "max_displacement_mm": 13.1409,
+  "anomalies_detected": 4,
+  "bbox_wgs84": [-99.1905879, 19.466346, -99.1661691, 19.4895052]
+}

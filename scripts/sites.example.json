@@ -1,0 +1,28 @@
+{
+  "defaults": {
+    "lookback_days": 45,
+    "max_granules": 6,
+    "stride_x": 6,
+    "stride_y": 3,
+    "prune_raw": true
+  },
+  "sites": [
+    {
+      "site_id": "mexico_city_iw2",
+      "sensor": "opera",
+      "burst_id": "T078-165486-IW2",
+      "subdataset": "/data/VV"
+    },
+    {
+      "site_id": "west_yorkshire_nisar",
+      "sensor": "nisar",
+      "short_name": "NISAR_L2_GSLC_V1",
+      "bbox": [-1.85, 53.55, -1.70, 53.68],
+      "subdataset": "/science/LSAR/GSLC/grids/frequencyA/HH",
+      "lookback_days": 60,
+      "stride_x": 4,
+      "stride_y": 4,
+      "prune_raw": false
+    }
+  ]
+}

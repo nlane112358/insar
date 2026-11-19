@@ -16,8 +16,11 @@ if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(OpenMP)
+find_package(GDAL REQUIRED)
 
 add_executable(insar_proto src/insar_engine_cpu.cpp)
+
+target_link_libraries(insar_proto PRIVATE GDAL::GDAL)
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(insar_proto PRIVATE OpenMP::OpenMP_CXX)
@@ -26,7 +29,7 @@ endif()
 if(MSVC)
     target_compile_options(insar_proto PRIVATE /O2 /arch:AVX2)
 else()
-    target_compile_options(insar_proto PRIVATE -O3 -ffast-math)
+    target_compile_options(insar_proto PRIVATE -O3 -fno-math-errno)
     if(APPLE OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)")
         check_cxx_compiler_flag("-mcpu=native" HAS_MCPU_NATIVE)
         if(HAS_MCPU_NATIVE)

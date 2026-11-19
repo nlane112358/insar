@@ -95,6 +95,7 @@ insar_proto_EXTERNAL_OBJECTS =
 
 insar_proto: CMakeFiles/insar_proto.dir/src/insar_engine_cpu.cpp.o
 insar_proto: CMakeFiles/insar_proto.dir/build.make
+insar_proto: /opt/homebrew/Cellar/gdal/3.13.3_6/lib/libgdal.dylib
 insar_proto: /opt/homebrew/opt/libomp/lib/libomp.dylib
 insar_proto: CMakeFiles/insar_proto.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/Users/nlane/workspace/storage/insar/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable insar_proto"

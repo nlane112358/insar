@@ -1,0 +1,89 @@
+{
+  "type": "Feature",
+  "stac_version": "1.1.0",
+  "id": "job_492700775b89",
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          -99.1905879,
+          19.4262209
+        ],
+        [
+          -99.1047828,
+          19.4262209
+        ],
+        [
+          -99.1047828,
+          19.4895511
+        ],
+        [
+          -99.1905879,
+          19.4895511
+        ],
+        [
+          -99.1905879,
+          19.4262209
+        ]
+      ]
+    ]
+  },
+  "properties": {
+    "datetime": "2026-11-19T11:49:08Z",
+    "insar:monitor_name": "mexico_city_demo_corridor",
+    "insar:processing_time_ms": 809.512,
+    "insar:valid_pixels": 492910,
+    "insar:min_displacement_mm": -94.4133,
+    "insar:max_displacement_mm": 12.8905,
+    "insar:anomalies_detected": 44
+  },
+  "links": [
+    {
+      "rel": "self",
+      "href": "http://127.0.0.1:8000/stac/items/job_492700775b89",
+      "type": "application/geo+json"
+    }
+  ],
+  "assets": {
+    "displacement_mm": {
+      "href": "http://127.0.0.1:8000/assets/job_492700775b89/displacement_mm.tif",
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Unwrapped Line-of-Sight Displacement (mm)",
+      "roles": [
+        "data"
+      ]
+    },
+    "coherence": {
+      "href": "http://127.0.0.1:8000/assets/job_492700775b89/coherence.tif",
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Interferometric Coherence (0-1)",
+      "roles": [
+        "data",
+        "quality"
+      ]
+    },
+    "wrapped_phase": {
+      "href": "http://127.0.0.1:8000/assets/job_492700775b89/wrapped_phase.tif",
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+      "title": "Wrapped Interferometric Phase (rad)",
+      "roles": [
+        "data"
+      ]
+    },
+    "alerts": {
+      "href": "http://127.0.0.1:8000/assets/job_492700775b89/alerts.geojson",
+      "type": "application/geo+json",
+      "title": "High-Coherence Displacement Anomaly Alerts",
+      "roles": [
+        "metadata"
+      ]
+    }
+  },
+  "bbox": [
+    -99.1905879,
+    19.4262209,
+    -99.1047828,
+    19.4895511
+  ]
+}

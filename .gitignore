@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+insar_work/
+mexico_city_run/
+nisar_raw/
+*.db-wal
+*.db-shm
