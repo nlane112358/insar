@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY CMakeLists.txt .
+COPY include/ ./include/
 COPY src/ ./src/
 
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j

@@ -20,7 +20,7 @@ Despite this surge in free, high-cadence radar data, most operational InSAR pipe
 
 The v0.1 prototype validates the core mathematical and systems foundation: fusing interferogram formation, coherence estimation, and coherence-weighted 2D phase unwrapping inside persistent memory buffers without intermediate disk I/O. It currently exists in two mathematically identical backends:
 
-- **Local CPU Prototype ([`src/insar_engine_cpu.cpp`](src/insar_engine_cpu.cpp)):** A zero-dependency C++20 + OpenMP implementation featuring a built-in, cache-blocked, multithreaded 2D radix-2 FFT. It runs locally on any standard laptop or workstation to verify millimeter-level accuracy and establish a clean CPU runtime baseline.
+- **Local CPU Prototype ([`include/insar/`](include/insar), [`src/engine/cpu_insar_engine.cpp`](src/engine/cpu_insar_engine.cpp)):** A zero-dependency C++20 + OpenMP implementation featuring a built-in, cache-blocked, multithreaded 2D radix-2 FFT. It runs locally on any standard laptop or workstation to verify millimeter-level accuracy and establish a clean CPU runtime baseline.
 - **GPU Prototype (`insar_engine.cu`):** A C++20 + CUDA / cuFFT implementation that keeps complex radar tiles, coherence weights, and iterative solver vectors resident in GPU VRAM to eliminate PCIe and storage bottlenecks.
 
 ### Core Pipeline Inside v0.1

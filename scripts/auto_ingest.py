@@ -15,6 +15,7 @@ and Cloud-Optimized GeoTIFF / JSON export.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -26,7 +27,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 SPEED_OF_LIGHT_M_S = 299_792_458.0
@@ -67,6 +68,8 @@ class SiteConfig:
     alert_mm: float | None = None
     alert_coh: float | None = None
     prune_raw: bool = False
+    stream: bool = False
+    stream_transport: str = "auto"
     work_dir: Path | None = None
 
     def resolved_subdataset(self) -> str:
@@ -81,6 +84,17 @@ class SiteConfig:
 
 
 @dataclass(frozen=True)
+class StreamTarget:
+    """Resolved GDAL VSI URI and auth metadata for cloud streaming."""
+
+    gdal_uri: str
+    fsspec_url: str
+    transport: str
+    bearer_token: str | None = None
+    s3_creds: Mapping[str, str] | None = None
+
+
+@dataclass(frozen=True)
 class GranuleCandidate:
     """Normalized catalog granule returned by a sensor provider."""
 
@@ -89,6 +103,8 @@ class GranuleCandidate:
     acq_time: str
     filename: str
     download_fn: Callable[[Path], Path]
+    stream_url: str = ""
+    stream_fn: Callable[[str], StreamTarget] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +151,38 @@ def _import_h5py() -> Any:
             "Install dependencies with: pip install -r scripts/requirements-ingest.txt"
         ) from exc
     return h5py
+
+
+def _import_fsspec() -> Any:
+    try:
+        import fsspec
+    except ImportError as exc:
+        raise RuntimeError(
+            "fsspec is required for remote HDF5 metadata streaming. "
+            "Install dependencies with: pip install -r scripts/requirements-ingest.txt"
+        ) from exc
+    return fsspec
+
+
+def _format_gdal_hdf5_uri(vsi_or_path: str, subdataset: str) -> str:
+    """Format an explicit GDAL HDF5 subdataset URI (supports /vsicurl/ and /vsis3/)."""
+    sub_norm = subdataset if subdataset.startswith("/") else f"/{subdataset}"
+    return f'HDF5:"{vsi_or_path}":/{sub_norm}'
+
+
+def _detect_aws_in_region(ea_mod: Any = None) -> bool:
+    """Best-effort non-blocking check for running inside AWS us-west-2."""
+    if os.environ.get("INSAR_AWS_IN_REGION", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    if ea_mod is not None:
+        store = getattr(ea_mod, "__store__", None)
+        if getattr(store, "in_region", False):
+            return True
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    in_aws_runtime = bool(
+        os.environ.get("AWS_EXECUTION_ENV") or os.environ.get("ECS_CONTAINER_METADATA_URI")
+    )
+    return in_aws_runtime and region == "us-west-2"
 
 
 def _utc_now() -> datetime:
@@ -386,6 +434,74 @@ def _normalize_opera_burst_id(burst_id: str | None) -> str | None:
     return cleaned
 
 
+def _resolve_https_redirect(session: Any, url: str) -> str:
+    """Resolve Earthdata/ASF OAuth redirects to the final GET-signed HTTPS URL without reading body."""
+    if session is None or not hasattr(session, "get"):
+        return url
+    with session.get(url, stream=True, allow_redirects=True, timeout=30) as resp:
+        resp.raise_for_status()
+        return str(getattr(resp, "url", "") or url)
+
+
+def _extract_bearer_token(session: Any, fallback_token: str | None = None) -> str | None:
+    if session is not None:
+        auth_hdr = str((getattr(session, "headers", None) or {}).get("Authorization", ""))
+        if auth_hdr.lower().startswith("bearer "):
+            return auth_hdr.split(None, 1)[1].strip()
+    return fallback_token or os.environ.get("EARTHDATA_TOKEN")
+
+
+def _resolve_asf_stream_target(
+    prod: Any,
+    session: Any,
+    subdataset: str,
+    transport: str,
+    ea_mod: Any = None,
+) -> StreamTarget:
+    """Resolve an ASFProduct into a GDAL /vsis3/ or /vsicurl/ HDF5 StreamTarget."""
+    props = prod.properties
+    https_url = str(props.get("url") or "")
+    s3_urls = [str(u) for u in (props.get("s3Urls") or []) if str(u).startswith("s3://")]
+
+    chosen = transport
+    if chosen == "auto":
+        chosen = "s3" if (s3_urls and _detect_aws_in_region(ea_mod)) else "https"
+
+    if chosen == "s3":
+        if not s3_urls:
+            raise RuntimeError(
+                f"ASF product '{props.get('sceneName')}' has no s3Urls for /vsis3/ streaming"
+            )
+        s3_url = s3_urls[0]
+        ea = ea_mod or _import_earthaccess()
+        auth = _login_earthaccess(ea)
+        creds = auth.get_s3_credentials(daac="ASF")
+        vsi_path = f"/vsis3/{s3_url[len('s3://'):]}"
+        return StreamTarget(
+            gdal_uri=_format_gdal_hdf5_uri(vsi_path, subdataset),
+            fsspec_url=s3_url,
+            transport="s3",
+            s3_creds={
+                "AWS_ACCESS_KEY_ID": creds["accessKeyId"],
+                "AWS_SECRET_ACCESS_KEY": creds["secretAccessKey"],
+                "AWS_SESSION_TOKEN": creds["sessionToken"],
+                "AWS_REGION": "us-west-2",
+            },
+        )
+
+    if not https_url:
+        raise RuntimeError(f"ASF product '{props.get('sceneName')}' has no HTTPS URL")
+    resolved_url = _resolve_https_redirect(session, https_url)
+    # Only pass Bearer token when no cross-origin redirect to a pre-signed CloudFront/S3 URL happened
+    bearer = _extract_bearer_token(session) if resolved_url == https_url else None
+    return StreamTarget(
+        gdal_uri=_format_gdal_hdf5_uri(f"/vsicurl/{resolved_url}", subdataset),
+        fsspec_url=resolved_url,
+        transport="https",
+        bearer_token=bearer,
+    )
+
+
 def fetch_opera_candidates(
     site: SiteConfig,
     asf_mod: Any = None,
@@ -410,6 +526,7 @@ def fetch_opera_candidates(
         maxResults=site.max_granules if site.max_granules > 0 else None,
     )
 
+    subdataset = resolved_site.resolved_subdataset()
     candidates: list[GranuleCandidate] = []
     for prod in results:
         props = prod.properties
@@ -417,13 +534,16 @@ def fetch_opera_candidates(
         if not gid:
             continue
         acq_time = _normalize_timestamp(props["startTime"])
+        url = str(props.get("url", ""))
         fname = props.get("fileName")
         if not fname:
-            url = props.get("url", "")
             fname = Path(urlparse(url).path).name or f"{gid}.h5"
 
         def _make_downloader(p: Any = prod, fn: str = fname) -> Callable[[Path], Path]:
             return lambda dest_dir: _atomic_asf_download(p, session, dest_dir, fn)
+
+        def _make_streamer(p: Any = prod) -> Callable[[str], StreamTarget]:
+            return lambda transport: _resolve_asf_stream_target(p, session, subdataset, transport)
 
         candidates.append(
             GranuleCandidate(
@@ -432,6 +552,8 @@ def fetch_opera_candidates(
                 acq_time=acq_time,
                 filename=fname,
                 download_fn=_make_downloader(),
+                stream_url=url,
+                stream_fn=_make_streamer(),
             )
         )
     return resolved_site, candidates
@@ -534,18 +656,86 @@ def _atomic_earthaccess_download(
     return dest_file
 
 
+def _pick_h5_links(granule: Any, access: str | None) -> list[str]:
+    if not hasattr(granule, "data_links"):
+        return []
+    try:
+        links = granule.data_links(access=access) if access is not None else granule.data_links()
+    except TypeError:
+        links = granule.data_links()
+    h5_links = [str(u) for u in links if str(u).lower().split("?")[0].endswith((".h5", ".hdf5"))]
+    return h5_links or [str(u) for u in links]
+
+
+def _resolve_earthaccess_stream_target(
+    granule: Any,
+    ea_mod: Any,
+    auth_provider: Callable[[], Any],
+    subdataset: str,
+    transport: str,
+) -> StreamTarget:
+    """Resolve an earthaccess DataGranule into a GDAL /vsis3/ or /vsicurl/ HDF5 StreamTarget."""
+    auth = auth_provider()
+    s3_links = _pick_h5_links(granule, "direct")
+    https_links = _pick_h5_links(granule, "external")
+
+    chosen = transport
+    if chosen == "auto":
+        chosen = "s3" if (s3_links and _detect_aws_in_region(ea_mod)) else "https"
+
+    if chosen == "s3":
+        if not s3_links:
+            gid = granule.get("umm", {}).get("GranuleUR", "granule")
+            raise RuntimeError(f"Granule '{gid}' has no S3 links for /vsis3/ streaming")
+        s3_url = s3_links[0]
+        endpoint = granule.get_s3_credentials_endpoint() if hasattr(granule, "get_s3_credentials_endpoint") else None
+        provider = granule.get("meta", {}).get("provider-id")
+        if endpoint:
+            creds = auth.get_s3_credentials(endpoint=endpoint)
+        elif provider:
+            creds = auth.get_s3_credentials(provider=provider)
+        else:
+            creds = auth.get_s3_credentials(daac="ASF")
+        vsi_path = f"/vsis3/{s3_url[len('s3://'):]}"
+        return StreamTarget(
+            gdal_uri=_format_gdal_hdf5_uri(vsi_path, subdataset),
+            fsspec_url=s3_url,
+            transport="s3",
+            s3_creds={
+                "AWS_ACCESS_KEY_ID": creds["accessKeyId"],
+                "AWS_SECRET_ACCESS_KEY": creds["secretAccessKey"],
+                "AWS_SESSION_TOKEN": creds["sessionToken"],
+                "AWS_REGION": "us-west-2",
+            },
+        )
+
+    if not https_links:
+        gid = granule.get("umm", {}).get("GranuleUR", "granule")
+        raise RuntimeError(f"Granule '{gid}' has no HTTPS links for /vsicurl/ streaming")
+    https_url = https_links[0]
+    sess = auth.get_session() if hasattr(auth, "get_session") else None
+    resolved_url = _resolve_https_redirect(sess, https_url)
+    token = (getattr(auth, "token", None) or {}).get("access_token") if resolved_url == https_url else None
+    return StreamTarget(
+        gdal_uri=_format_gdal_hdf5_uri(f"/vsicurl/{resolved_url}", subdataset),
+        fsspec_url=resolved_url,
+        transport="https",
+        bearer_token=token,
+    )
+
+
 def fetch_nisar_candidates(
     site: SiteConfig,
     ea_mod: Any = None,
 ) -> tuple[SiteConfig, list[GranuleCandidate]]:
     """Query NASA CMR via earthaccess for NISAR L2 GSLC granules."""
     ea = ea_mod or _import_earthaccess()
-    auth_state = {"authenticated": False}
+    auth_state: dict[str, Any] = {"auth": None}
 
-    def _ensure_authenticated() -> None:
-        if not auth_state["authenticated"]:
-            _login_earthaccess(ea)
-            auth_state["authenticated"] = True
+    def _ensure_authenticated() -> Any:
+        if auth_state["auth"] is None:
+            auth_state["auth"] = _login_earthaccess(ea)
+        return auth_state["auth"]
 
     now = _utc_now()
     start_date = (now - timedelta(days=site.lookback_days)).strftime("%Y-%m-%d")
@@ -570,6 +760,7 @@ def fetch_nisar_candidates(
     results = ea.search_data(**search_kwargs)
 
     site_dir = _normalize_direction(site.direction)
+    subdataset = site.resolved_subdataset()
     per_stream: dict[str, list[GranuleCandidate]] = {}
 
     for granule in results:
@@ -581,11 +772,19 @@ def fetch_nisar_candidates(
         if site_dir is not None and info["direction"] != site_dir:
             continue
 
+        https_links = _pick_h5_links(granule, "external")
+        preview_url = https_links[0] if https_links else info["filename"]
+
         def _make_downloader(g: Any = granule, fn: str = info["filename"]) -> Callable[[Path], Path]:
             def _download(dest_dir: Path) -> Path:
                 _ensure_authenticated()
                 return _atomic_earthaccess_download(ea, g, dest_dir, fn)
             return _download
+
+        def _make_streamer(g: Any = granule) -> Callable[[str], StreamTarget]:
+            return lambda transport: _resolve_earthaccess_stream_target(
+                g, ea, _ensure_authenticated, subdataset, transport
+            )
 
         cand = GranuleCandidate(
             granule_id=info["granule_id"],
@@ -593,6 +792,8 @@ def fetch_nisar_candidates(
             acq_time=info["acq_time"],
             filename=info["filename"],
             download_fn=_make_downloader(),
+            stream_url=preview_url,
+            stream_fn=_make_streamer(),
         )
         per_stream.setdefault(cand.stream_key, []).append(cand)
 
@@ -622,8 +823,8 @@ def _extract_scalar_float(raw: Any) -> float | None:
     return float(raw)
 
 
-def _read_center_frequency_hz(h5_path: Path, subdataset: str, h5py_mod: Any) -> float | None:
-    """Read centerFrequency (in Hz) from a NISAR HDF5 file."""
+def _read_center_frequency_hz_from_h5file(h5_file: Any, subdataset: str) -> float | None:
+    """Read centerFrequency (in Hz) from an already-open h5py.File."""
     sub_norm = subdataset if subdataset.startswith("/") else f"/{subdataset}"
     parent = sub_norm.rsplit("/", 1)[0] if "/" in sub_norm[1:] else ""
     candidates: list[str] = []
@@ -637,27 +838,266 @@ def _read_center_frequency_hz(h5_path: Path, subdataset: str, h5py_mod: Any) -> 
         if fallback not in candidates:
             candidates.append(fallback)
 
-    with h5py_mod.File(h5_path, "r") as f:
-        for ds_path in candidates:
-            if ds_path not in f:
-                continue
-            ds = f[ds_path]
-            freq_val = _extract_scalar_float(ds[()])
-            if freq_val is None:
-                continue
-            units_raw = ds.attrs.get("units", "Hz")
-            if isinstance(units_raw, bytes):
-                units_raw = units_raw.decode("utf-8", errors="ignore")
-            units = str(units_raw).strip().lower()
-            if units == "mhz":
-                freq_val *= 1e6
-            elif units == "ghz":
-                freq_val *= 1e9
-            elif units == "khz":
-                freq_val *= 1e3
-            if freq_val > 0.0:
-                return freq_val
+    for ds_path in candidates:
+        if ds_path not in h5_file:
+            continue
+        ds = h5_file[ds_path]
+        freq_val = _extract_scalar_float(ds[()])
+        if freq_val is None:
+            continue
+        units_raw = ds.attrs.get("units", "Hz")
+        if isinstance(units_raw, bytes):
+            units_raw = units_raw.decode("utf-8", errors="ignore")
+        units = str(units_raw).strip().lower()
+        if units == "mhz":
+            freq_val *= 1e6
+        elif units == "ghz":
+            freq_val *= 1e9
+        elif units == "khz":
+            freq_val *= 1e3
+        if freq_val > 0.0:
+            return freq_val
     return None
+
+
+def _read_center_frequency_hz(h5_path: Path, subdataset: str, h5py_mod: Any) -> float | None:
+    """Read centerFrequency (in Hz) from a local NISAR HDF5 file."""
+    with h5py_mod.File(h5_path, "r") as f:
+        return _read_center_frequency_hz_from_h5file(f, subdataset)
+
+
+@contextlib.contextmanager
+def _open_remote_h5(
+    target: StreamTarget,
+    h5py_mod: Any = None,
+    fsspec_mod: Any = None,
+) -> Iterator[Any]:
+    """Open a remote (/vsicurl/ HTTPS or /vsis3/ S3) HDF5 file via fsspec byte-range requests."""
+    h5py = h5py_mod or _import_h5py()
+    fsspec = fsspec_mod or _import_fsspec()
+
+    if target.transport == "s3":
+        s3_creds = target.s3_creds or {}
+        fs = fsspec.filesystem(
+            "s3",
+            key=s3_creds.get("AWS_ACCESS_KEY_ID"),
+            secret=s3_creds.get("AWS_SECRET_ACCESS_KEY"),
+            token=s3_creds.get("AWS_SESSION_TOKEN"),
+        )
+        with fs.open(target.fsspec_url, "rb", block_size=65536) as fobj:
+            with h5py.File(fobj, "r") as hf:
+                yield hf
+        return
+
+    client_kwargs: dict[str, Any] = {}
+    if target.bearer_token:
+        client_kwargs = {
+            "headers": {"Authorization": f"Bearer {target.bearer_token}"},
+            "trust_env": False,
+        }
+    fs = fsspec.filesystem("http", client_kwargs=client_kwargs) if client_kwargs else fsspec.filesystem("http")
+    with fs.open(target.fsspec_url, "rb", block_size=65536) as fobj:
+        with h5py.File(fobj, "r") as hf:
+            yield hf
+
+
+def _read_grid_geometry_from_h5file(
+    h5_file: Any,
+    subdataset: str,
+) -> tuple[int, int, float, float, float, float, str] | None:
+    """Extract grid dimensions, top-left origin, pixel spacing, and CRS from HDF5 metadata."""
+    sub_norm = subdataset if subdataset.startswith("/") else f"/{subdataset}"
+    parent = sub_norm.rsplit("/", 1)[0] if "/" in sub_norm[1:] else ""
+    if not parent or parent not in h5_file:
+        return None
+    grp = h5_file[parent]
+
+    x_ds = grp.get("xCoordinates") or grp.get("x_coordinates")
+    y_ds = grp.get("yCoordinates") or grp.get("y_coordinates")
+    if x_ds is None or y_ds is None or len(x_ds) < 2 or len(y_ds) < 2:
+        return None
+
+    nx = len(x_ds)
+    ny = len(y_ds)
+    x0, x1 = float(x_ds[0]), float(x_ds[1])
+    y0, y1 = float(y_ds[0]), float(y_ds[1])
+    dx = x1 - x0
+    dy = y1 - y0
+    if dx == 0.0 or dy == 0.0:
+        return None
+
+    gt_x0 = x0 - 0.5 * dx
+    gt_y0 = y0 - 0.5 * dy
+
+    target_srs: str | None = None
+    proj_ds = grp.get("projection")
+    if proj_ds is not None:
+        epsg_attr = proj_ds.attrs.get("epsg_code")
+        if epsg_attr is not None:
+            epsg_val = int(_extract_scalar_float(epsg_attr) or 0)
+            if epsg_val > 0:
+                target_srs = f"EPSG:{epsg_val}"
+        if target_srs is None:
+            spatial_ref = proj_ds.attrs.get("spatial_ref")
+            if isinstance(spatial_ref, bytes):
+                spatial_ref = spatial_ref.decode("utf-8", errors="ignore")
+            if spatial_ref:
+                target_srs = str(spatial_ref)
+        if target_srs is None:
+            proj_scalar = _extract_scalar_float(proj_ds[()])
+            if proj_scalar and proj_scalar > 0:
+                target_srs = f"EPSG:{int(proj_scalar)}"
+
+    if not target_srs:
+        return None
+    return (nx, ny, gt_x0, gt_y0, dx, dy, target_srs)
+
+
+def compute_window_from_bbox(
+    bbox: tuple[float, float, float, float],
+    grid: tuple[int, int, float, float, float, float, str],
+    max_dims: tuple[int, int] | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Convert a WGS84 bounding box into a clamped pixel crop window (x, y, w, h)."""
+    nx, ny, gt_x0, gt_y0, dx, dy, target_srs = grid
+    if max_dims is not None:
+        nx = min(nx, max_dims[0])
+        ny = min(ny, max_dims[1])
+
+    min_lon, min_lat, max_lon, max_lat = bbox
+    corners = (
+        f"{min_lon} {min_lat}\n"
+        f"{max_lon} {min_lat}\n"
+        f"{max_lon} {max_lat}\n"
+        f"{min_lon} {max_lat}\n"
+    )
+    tr = subprocess.run(
+        ["gdaltransform", "-s_srs", "EPSG:4326", "-t_srs", target_srs],
+        input=corners,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    pts: list[tuple[float, float]] = []
+    for line in tr.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            pts.append((float(parts[0]), float(parts[1])))
+    if len(pts) < 4:
+        raise RuntimeError(f"gdaltransform returned unexpected output for {target_srs}: {tr.stdout!r}")
+
+    pxs = [(px - gt_x0) / dx for px, _ in pts]
+    pys = [(py - gt_y0) / dy for _, py in pts]
+
+    wx0 = max(0, int(min(pxs)))
+    wy0 = max(0, int(min(pys)))
+    wx1 = min(nx, int(max(pxs) + 0.999))
+    wy1 = min(ny, int(max(pys) + 0.999))
+    ww = wx1 - wx0
+    wh = wy1 - wy0
+    if ww <= 0 or wh <= 0:
+        return None
+    return (wx0, wy0, ww, wh)
+
+
+def _inspect_stream_pair(
+    ref_target: StreamTarget,
+    sec_target: StreamTarget,
+    site: SiteConfig,
+    subdataset: str,
+    h5py_mod: Any = None,
+    fsspec_mod: Any = None,
+) -> tuple[float | None, tuple[int, int, int, int] | None]:
+    """Read remote HDF5 header once for NISAR wavelength and optional bbox auto-window."""
+    need_wavelength = site.wavelength_mm is None and site.sensor == "nisar"
+    need_window = site.window is None and site.bbox is not None
+    if not need_wavelength and not need_window:
+        return site.wavelength_mm, site.window
+
+    wavelength_mm = site.wavelength_mm
+    window = site.window
+
+    with _open_remote_h5(ref_target, h5py_mod=h5py_mod, fsspec_mod=fsspec_mod) as ref_hf:
+        if need_wavelength:
+            freq_hz = _read_center_frequency_hz_from_h5file(ref_hf, subdataset)
+            if freq_hz is None:
+                print(
+                    f"Warning: centerFrequency not found in remote header; "
+                    f"falling back to {NISAR_DEFAULT_WAVELENGTH_MM:.1f} mm"
+                )
+                wavelength_mm = NISAR_DEFAULT_WAVELENGTH_MM
+            else:
+                wavelength_mm = (SPEED_OF_LIGHT_M_S / freq_hz) * 1000.0
+
+        if need_window and site.bbox is not None:
+            grid = _read_grid_geometry_from_h5file(ref_hf, subdataset)
+            if grid is None:
+                raise RuntimeError(
+                    "Could not read HDF5 coordinate/projection metadata for auto-window; "
+                    "pass --window x y w h explicitly."
+                )
+            sec_dims: tuple[int, int] | None = None
+            with _open_remote_h5(sec_target, h5py_mod=h5py_mod, fsspec_mod=fsspec_mod) as sec_hf:
+                if subdataset in sec_hf:
+                    sh = sec_hf[subdataset].shape
+                    sec_dims = (int(sh[1]), int(sh[0]))
+                if need_wavelength and wavelength_mm is not None:
+                    sec_freq_hz = _read_center_frequency_hz_from_h5file(sec_hf, subdataset)
+                    if sec_freq_hz is not None:
+                        sec_wl = (SPEED_OF_LIGHT_M_S / sec_freq_hz) * 1000.0
+                        if abs(wavelength_mm - sec_wl) > 0.5:
+                            print(
+                                f"Warning: radar wavelength mismatch ({wavelength_mm:.3f} mm vs "
+                                f"{sec_wl:.3f} mm); using reference wavelength."
+                            )
+            window = compute_window_from_bbox(site.bbox, grid, max_dims=sec_dims)
+
+    return wavelength_mm, window
+
+
+@contextlib.contextmanager
+def _stream_subprocess_env(
+    ref_target: StreamTarget | None,
+    sec_target: StreamTarget | None,
+) -> Iterator[dict[str, str]]:
+    """Build GDAL environment variables for low-bandwidth /vsicurl/ or /vsis3/ streaming."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+            "VSI_CACHE": "FALSE",
+            "GDAL_PAM_ENABLED": "NO",
+            "CPL_VSIL_CURL_CHUNK_SIZE": "65536",
+            "CPL_VSIL_CURL_USE_HEAD": "NO",
+            "GDAL_SKIP": "NETCDF",
+        }
+    )
+
+    for target in (ref_target, sec_target):
+        if target and target.s3_creds:
+            env.update(target.s3_creds)
+            env["AWS_NO_SIGN_REQUEST"] = "NO"
+            break
+
+    bearer_token = None
+    for target in (ref_target, sec_target):
+        if target and target.bearer_token:
+            bearer_token = target.bearer_token
+            break
+
+    header_path: Path | None = None
+    try:
+        if bearer_token:
+            fd, tmp_name = tempfile.mkstemp(prefix="gdal_edl_hdr_", suffix=".txt")
+            header_path = Path(tmp_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                os.chmod(header_path, 0o600)
+                fh.write(f"Authorization: Bearer {bearer_token}\r\n")
+            env["GDAL_HTTP_HEADER_FILE"] = str(header_path)
+        yield env
+    finally:
+        if header_path is not None and header_path.exists():
+            header_path.unlink()
 
 
 def read_nisar_wavelength_mm(
