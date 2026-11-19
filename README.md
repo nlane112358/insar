@@ -86,6 +86,40 @@ python3 -m pip install -r scripts/requirements-plot.txt
 
 The diverging maps fall back to the built-in palette if `cmcrameri` is unavailable. GIF export requires Pillow; use an `.mp4` output path when FFmpeg is installed.
 
+---
+
+## UK Test Sites — Greater London / Thames Valley & East Midlands Coalfields (NISAR L-Band GSLC)
+
+Two UK civil-infrastructure testbeds built around live NASA Earthdata **`NISAR_L2_GSLC_V1`** streaming (`/vsicurl/` + Copernicus GLO-30 DEM + UNR Eurasia-fixed **`EU`** GNSS datum validation + ONS May 2024 Local Authority District rollups) for **UK rail**, **water utilities (AMP8)**, and **home insurance** stakeholders:
+
+| Test Site & Track | Passes / Span | Datum & Geometry | Coherent Footprint ($\gamma \ge 0.35$) | UK Rail & AMP8 Water ($\gamma_w$) | ONS Insurance Zones |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Greater London & Thames Valley** (`NISAR_T101_F028_A`) | 2 passes · 12 d (`2026-10-31` – `2026-11-12`) | `AMER` Chalk (`[-0.5594, 51.6772]`) · Left Asc (`inc 40.79°`) | **2,224.66 km²** (`90.21%`) | Rail `24/24` (`0.7077`) · Water `33/33` (`0.6294`) | **57** fetched (`57` covered) |
+| **London East Triplet** (`NISAR_T173_F028_A`) | 3 passes · 24 d (`2026-10-24` – `2026-11-17`) | Dartford Chalk (`[0.215, 51.442]`) · Left Asc (`inc 46.35°`) | **515.82 km²** (`80.13%`) · Closure RMS `9.23 mm` (`2.26%` bad) | Rail `12/24` (`0.6580`) · Water `8/33` (`0.5355`) | **18** covered |
+| **East Midlands Coalfields** (`NISAR_T101_F028_A`) | 2 passes · 12 d (`2026-10-31` – `2026-11-12`) | `KEYW` Mercia Mudstone (`[-1.0781, 52.8790]`) · Left Asc (`inc 40.95°`) | **1,279.71 km²** (`86.68%`) | Rail `21/23` (`0.6370`) · Water `35/45` (`0.5917`) | **19** fetched (`15` covered) |
+| **East Midlands Peak–Coal** (`NISAR_T052_F061_D`) | 2 passes · 12 d (`2026-10-27` – `2026-11-08`) | Ashover Gritstone (`[-1.500, 53.185]`) · Left Desc (`inc 44.14°`) | **1,102.05 km²** (`87.62%`) · DEM $r$: `-0.65 → -0.03` | Rail `8/23` (`0.6716`) · Water `19/45` (`0.6161`) | **12** covered |
+
+- **Scientific Honesty & Stack Maturity Gating (`60 d` Gate):** Current operational NISAR archive availability over both UK sites spans `12`–`24` days, so every site accurately reports `stack_mature = false` (`12 d / 24 d < 60 d`) and downgrades annualized velocities to **provisional baseline diagnostics**. Matched **UNR `EU` GNSS** bedrock velocities (`16` stations in London including `AMER +0.4 ± 1.2`, `LICC +1.8 ± 0.9`, `STR3 +1.0 ± 1.2`, `TEDD +1.0 ± 0.9 mm/yr`; `4` stations in East Midlands including `KEYW +0.7 ± 0.9 mm/yr`, single-pair residual `+2.8 mm/yr` = `0.09 mm` over 12 days) confirm geodetic datum stability, while 12-day single-pair scatter (`spatial std ≈ 43–331 mm/yr`, i.e., `±1.4–10.9 mm`) illustrates why `min_alert_span_days = 60` gating is enforced before seasonal London Clay shrink-swell or mine-water rebound rates trigger infrastructure alerts.
+- **L-Band Triplet Closure & DEM Tropospheric Mitigation:** With L-band triplet threshold `--closure-thresh-mm 25.0`, the 3-pass London East stack achieves `9.2282 mm` closure RMS (`0` rejected pairs). Across the Derbyshire/Nottinghamshire terrain step (`T052`), joint IRLS polynomial + Copernicus GLO-30 DEM tropospheric estimation drops frame RMS from `16.33 mm` to `6.19 mm` and suppresses elevation correlation (`r = -0.6455` $\to$ `-0.0346`).
+
+<p align="center">
+  <img src="docs/figures/london_thames_displacement_map.png" alt="Greater London and Thames Valley NISAR L-band cumulative LOS displacement map" width="48%">
+  <img src="docs/figures/east_midlands_coalfields_displacement_map.png" alt="East Midlands Coalfields NISAR L-band cumulative LOS displacement map" width="48%">
+</p>
+
+<p align="center">
+  <img src="docs/figures/london_thames_sector_dashboard.png" alt="Greater London UK Rail, AMP8 Water Utilities, and Home Insurance District dashboard" width="96%">
+</p>
+
+<p align="center">
+  <img src="docs/figures/east_midlands_sector_dashboard.png" alt="East Midlands Coalfields UK Rail, AMP8 Water Utilities, and Home Insurance District dashboard" width="96%">
+</p>
+
+<p align="center">
+  <img src="docs/figures/london_east_t173_triplet_closure.png" alt="London East NISAR T173 3-pass triplet closure diagnostic" width="48%">
+  <img src="docs/figures/east_midlands_track_comparison.png" alt="East Midlands NISAR Ascending T101 vs Descending T052 comparison" width="48%">
+</p>
+
 ### Interactive site reports
 
 - [Mexico City · Sentinel-1 C-band](docs/interactive/mexico_city.html)
@@ -105,8 +139,9 @@ Each HTML embeds its stack COGs and feature data for building-scale zoom and cor
 | **Control Plane** | [`api/server.py`](api/server.py) | FastAPI monitor/job/stack APIs, PostGIS spatial screening, STAC catalog, S3 range reads, API key checks, and transactional outbox enqueueing |
 | **Compute Plane** | [`services/worker/`](services/worker) · [`services/platform/workflows/`](services/platform/workflows) | Celery workers execute typed ingestion, pairwise, and stack tasks; Redis-backed scheduling retries work after transient failures |
 | **State & Artifacts** | [`services/platform/storage/`](services/platform/storage) · [`docker-compose.yml`](docker-compose.yml) | PostGIS is the system of record; MinIO/S3 stores artifact objects and checksums; SQLite/filesystem mode remains available for a standalone developer run |
-| **DEM & GNSS Validation** | [`services/platform/catalog/dem_service.py`](services/platform/catalog/dem_service.py) · [`services/platform/validation/`](services/platform/validation) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
-| **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) · [`scripts/plots/plot_extended_visualizations.py`](scripts/plots/plot_extended_visualizations.py) · [`scripts/plots/plot_stack_evolution.py`](scripts/plots/plot_stack_evolution.py) | Standalone raster maps, corridor heatmaps, confidence diagnostics, GNSS residuals, transects, track comparisons, and replayed stack evolution panels |
+| **DEM & GNSS Validation** | [`services/platform/catalog/dem_service.py`](services/platform/catalog/dem_service.py) · [`services/platform/validation/`](services/platform/validation) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation (`--gnss-frame auto\|NA\|EU`, `--look-direction auto\|right\|left`) with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
+| **UK Corridors & Sectors** | [`scripts/fetch_corridors.py`](scripts/fetch_corridors.py) · [`scripts/uk_sector_analytics.py`](scripts/uk_sector_analytics.py) | Overpass UK rail/AMP8 water/transport corridor presets (`london_thames`, `east_midlands_coalfields`), ONS May 2024 UK Local Authority District boundaries (`--zones-preset`), and sector/insurance rollups |
+| **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) · [`scripts/plots/plot_uk_sites.py`](scripts/plots/plot_uk_sites.py) · [`scripts/plots/plot_extended_visualizations.py`](scripts/plots/plot_extended_visualizations.py) · [`scripts/plots/plot_stack_evolution.py`](scripts/plots/plot_stack_evolution.py) | Standalone raster maps, UK sector dashboards, triplet closure & Asc/Desc track comparisons, corridor heatmaps, confidence diagnostics, GNSS residuals, transects, and replayed stack evolution panels |
 | **Interactive Maps** | [`scripts/plots/export_interactive_map.py`](scripts/plots/export_interactive_map.py) · [`api/server.py`](api/server.py) | Embedded-COG reports with basemap toggle, opacity and swipe controls, clickable corridor/GNSS charts, and live job previews at `/preview/{job_id}` |
 | **Operator CLI** | [`cli/insarctl.py`](cli/insarctl.py) | Thin commands for Compose lifecycle, health and screening queries, monitor sync, and legacy local scientific commands |
 
@@ -206,6 +241,29 @@ python3 scripts/plots/export_interactive_map.py \
   --stack-dir insar_work/stacks/west_yorkshire_t052 \
   --corridors data/corridors/west_yorkshire_corridors.geojson \
   --output docs/interactive/west_yorkshire.html
+
+# 7. UK NISAR L-band test sites: fetch Overpass corridors + ONS LAD24 zones, stream/stack, roll up sectors & validate UNR EU GNSS
+python3 scripts/fetch_corridors.py --preset london_thames --balance-classes --max-features 80 --out data/corridors/london_thames_corridors.geojson
+python3 scripts/fetch_corridors.py --zones-preset london_thames --out data/zones/london_thames_zones.geojson
+.venv/bin/python scripts/auto_ingest.py \
+  --sites-config scripts/sites.example.json \
+  --site-id london_thames_nisar,london_east_nisar_t173,east_midlands_coalfields_nisar,east_midlands_coalfields_t052 \
+  --continue-on-error
+python3 scripts/uk_sector_analytics.py \
+  --stack-dir insar_work/stacks/london_thames_nisar \
+  --profile london_thames \
+  --zones data/zones/london_thames_zones.geojson \
+  --out-json data/validation/london_thames_sector_report.json \
+  --out-zones-csv data/validation/london_thames_insurance_zones.csv \
+  --out-sectors-csv data/validation/london_thames_sectors.csv
+python3 scripts/plots/plot_uk_sites.py dashboard \
+  --report-json data/validation/london_thames_sector_report.json \
+  --out docs/figures/london_thames_sector_dashboard.png
+python3 scripts/validate_gnss.py \
+  --stack-dir insar_work/stacks/london_thames_nisar \
+  --gnss-frame EU --look-direction left --incidence-deg 40.79 --heading-deg -22.426 \
+  --out-json data/validation/london_thames_gnss_validation.json \
+  --out-csv data/validation/london_thames_gnss_validation.csv
 ```
 
 The reports provide satellite/dark basemap selection, raster opacity, a velocity/coherence swipe, clickable corridor displacement histories, and GNSS station charts where validation data are available. The HTML embeds the raster and feature payloads; Leaflet, Chart.js, and basemap tiles load from public CDNs.

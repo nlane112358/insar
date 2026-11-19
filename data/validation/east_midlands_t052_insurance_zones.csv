@@ -1,0 +1,13 @@
+zone_id,name,total_pixels,valid_pixels,coherent_coverage_pct,coherent_area_km2,mean_coherence,high_coh_pct,median_disp_mm,p95_abs_disp_mm,iqr_disp_mm,p95_p5_spread_mm,mean_vel_mm_yr,p95_abs_vel_mm_yr,uplift_pct,settlement_pct,snr_ge_2_5_pct,exposure_tier
+E07000171,Bassetlaw,135828,114764,84.49,183.62,0.6076,63.47,-4.63,17.74,9.92,25.38,-143.47,539.99,64.52,19.22,0.0,provisional_immature
+E07000175,Newark and Sherwood,141328,117233,82.95,187.57,0.5998,62.29,1.71,12.28,8.41,20.26,38.04,373.63,28.83,48.17,0.0,provisional_immature
+E08000019,Sheffield,37766,36682,97.13,58.69,0.6981,84.21,2.73,12.01,8.24,19.13,78.56,365.7,20.58,54.64,0.0,provisional_immature
+E08000018,Rotherham,41226,33663,81.65,53.86,0.6221,65.89,-0.62,12.1,7.43,18.88,-30.3,368.23,39.9,31.17,0.0,provisional_immature
+E07000173,Gedling,15899,13670,85.98,21.87,0.6221,68.65,-6.66,16.4,7.75,18.43,-206.73,499.21,79.73,5.24,0.0,provisional_immature
+E07000033,Bolsover,101690,88920,87.44,142.27,0.626,68.6,-1.05,11.47,7.12,18.4,-34.96,349.24,42.64,28.29,0.0,provisional_immature
+E07000035,Derbyshire Dales,4888,4392,89.85,7.03,0.6194,69.95,0.45,11.16,6.99,18.13,-1.1,339.56,31.74,37.96,0.0,provisional_immature
+E07000170,Ashfield,48419,43724,90.3,69.96,0.6554,74.48,-1.78,12.34,6.51,17.76,-69.29,375.62,48.23,18.89,0.0,provisional_immature
+E07000174,Mansfield,48717,43207,88.69,69.13,0.6565,73.34,0.25,10.95,5.82,17.38,4.21,333.42,29.77,33.07,0.0,provisional_immature
+E07000038,North East Derbyshire,146373,132790,90.72,212.46,0.6172,67.55,-0.11,10.71,6.48,17.08,-15.56,326.13,35.03,31.9,0.0,provisional_immature
+E07000032,Amber Valley,35652,29272,82.1,46.84,0.631,70.95,-0.82,10.89,6.61,16.89,-35.91,331.52,40.6,27.03,0.0,provisional_immature
+E07000034,Chesterfield,42063,38825,92.3,62.12,0.6826,79.83,-1.0,10.29,5.31,14.61,-49.04,313.18,40.19,18.11,0.0,provisional_immature

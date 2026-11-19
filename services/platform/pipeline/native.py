@@ -47,7 +47,7 @@ def run_native_command(
     engine: Literal["pairwise", "stack"],
     *,
     environment: dict[str, str] | None = None,
-) -> None:
+) -> str:
     backend = os.getenv("INSAR_COMPUTE_BACKEND", "auto").lower()
     if backend != "subprocess":
         try:
@@ -74,6 +74,7 @@ def run_native_command(
                         os.environ.update(previous)
             if code != 0:
                 raise subprocess.CalledProcessError(code, command)
-            return
+            return ""
 
-    subprocess.run(command, capture_output=True, text=True, check=True, env=environment)
+    proc = subprocess.run(command, capture_output=True, text=True, check=True, env=environment)
+    return proc.stdout or ""

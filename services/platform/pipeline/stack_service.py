@@ -272,8 +272,7 @@ def _export_params_key(cfg: StackConfig) -> dict[str, Any]:
 def _run_insar_stack(cmd: list[str]) -> str:
     from services.platform.pipeline.native import run_native_command
 
-    run_native_command(cmd, "stack")
-    return ""
+    return run_native_command(cmd, "stack")
 
 
 def _update_corridor_timeseries(

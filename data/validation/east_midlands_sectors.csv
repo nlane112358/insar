@@ -1,0 +1,4 @@
+sector,label,total_assets,covered_assets,valid_pixels,coherent_coverage_pct,weighted_mean_coherence,median_p95_abs_vel_mm_yr,max_abs_disp_mm,maturity_gated_assets
+uk_rail,"UK Rail (Mainlines, Metro & Light Rail)",23,21,28302,91.29,0.637,348.16,56.46,0
+water_amp8,"Water Utilities (AMP8 Reservoirs, Dams, WTWs & Waterways)",45,35,42442,79.33,0.5917,470.67,71.39,0
+strategic_transport,"Strategic Transport (Motorways, Trunk Roads & Runways)",12,10,19667,89.29,0.6102,429.48,62.07,0

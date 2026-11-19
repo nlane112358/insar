@@ -133,11 +133,22 @@ def plot_uk_sector_dashboard(report_json: Path, out_path: Path, *, dpi: int = 23
         ax_ins.barh(y_z, s_bars, left=u_bars, color="#D45D35", height=0.62, label="Settlement (range +)")
         ax_ins.set_yticks(y_z)
         ax_ins.set_yticklabels([shorten_name(str(z["name"]), 22) for z in top_zones], fontsize=8.0)
-        xmax_c = max(spreads) * 1.35 if spreads else 10.0
+        xmax_c = max(spreads) * 1.42 if spreads else 10.0
         ax_ins.set_xlim(0.0, max(5.0, xmax_c))
+        ax_ins.set_ylim(-1.55, len(top_zones) - 0.35)
         for yi, z, sp in zip(y_z, top_zones, spreads):
             ax_ins.text(sp + xmax_c * 0.015, yi, f"{sp:.1f} mm · γ={z['mean_coherence']:.2f}", va="center", ha="left", fontsize=7.2, color=INK)
-        ax_ins.legend(loc="lower right", fontsize=7.6, frameon=True, facecolor="white", framealpha=0.88, edgecolor="#E0E4EA")
+        ax_ins.legend(
+            loc="lower center",
+            ncol=2,
+            columnspacing=1.0,
+            handletextpad=0.5,
+            fontsize=7.3,
+            frameon=True,
+            facecolor="white",
+            framealpha=0.92,
+            edgecolor="#E0E4EA",
+        )
     ax_ins.set_xlabel("Intra-District Differential Spread (p95 − p5, mm)")
     ax_ins.set_title("C. Home Insurance District Exposure", loc="left", fontsize=11.0, fontweight="bold")
     ax_ins.grid(axis="x", alpha=0.45)

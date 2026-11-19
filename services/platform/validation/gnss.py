@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from services.platform.storage.database import get_db
+from services.platform.storage.database import get_db, init_db
 
 
 def validate_stack(stack_dir: Path, **options: Any) -> Any:
@@ -21,6 +21,7 @@ def validate_stack(stack_dir: Path, **options: Any) -> Any:
     if metrics:
         measured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         metric_id = hashlib.sha256(f"gnss:{monitor_name}:{job_id or stack_dir}:{measured_at}".encode()).hexdigest()
+        init_db()
         with get_db() as conn:
             conn.execute(
                 """INSERT INTO validation_metrics (metric_id, monitor_name, job_id, measured_at, metrics_json)
