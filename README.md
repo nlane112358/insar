@@ -2,9 +2,9 @@
 
 This project is a high-performance, native C++20 InSAR (Interferometric Synthetic Aperture Radar) processing engine designed to convert satellite radar observations into millimeter-scale ground-deformation measurements at near real-time speeds. Its core goal is to replace slow, batch-oriented academic InSAR scripts with a memory-resident, GPU-accelerated computational engine capable of continuous, corridor- and country-scale infrastructure monitoring.
 
-![InSAR Prototype Output](insar_proto_check.png)
+![NISAR InSAR Output Preview](nisar_preview.png)
 
-*Left to right: (1) wrapped $7\times 7$ interferometric phase $\psi \in [-\pi, \pi]$, (2) estimated coherence $\gamma \in [0, 1]$ showing the simulated decorrelated patch, (3) unwrapped line-of-sight (LOS) displacement in mm, and (4) residual error against synthetic ground truth after global offset alignment.*
+*Left to right (`NISAR_T052_F061_D_2026-10-27_2026-11-08`): (1) wrapped interferometric phase $\psi \in [-\pi, \pi]$ (rad), (2) estimated coherence $\gamma \in [0, 1]$, and (3) unwrapped line-of-sight (LOS) displacement (mm) with detected high-coherence anomaly alerts overlaid (`Alerts (17)`).*
 
 ---
 

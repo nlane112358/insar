@@ -1000,29 +1000,45 @@ def compute_window_from_bbox(
     return (wx0, wy0, ww, wh)
 
 
-def _inspect_stream_pair(
-    ref_target: StreamTarget,
-    sec_target: StreamTarget,
+@contextlib.contextmanager
+def _open_h5_source(
+    source: Path | StreamTarget,
+    h5py_mod: Any = None,
+    fsspec_mod: Any = None,
+) -> Iterator[Any]:
+    """Open either a local HDF5 Path or a remote StreamTarget via h5py."""
+    h5py = h5py_mod or _import_h5py()
+    if isinstance(source, Path):
+        with h5py.File(source, "r") as hf:
+            yield hf
+    else:
+        with _open_remote_h5(source, h5py_mod=h5py, fsspec_mod=fsspec_mod) as hf:
+            yield hf
+
+
+def _inspect_pair_metadata(
+    ref_source: Path | StreamTarget,
+    sec_source: Path | StreamTarget,
     site: SiteConfig,
     subdataset: str,
     h5py_mod: Any = None,
     fsspec_mod: Any = None,
 ) -> tuple[float | None, tuple[int, int, int, int] | None]:
-    """Read remote HDF5 header once for NISAR wavelength and optional bbox auto-window."""
+    """Read HDF5 header metadata once for NISAR wavelength and optional bbox auto-window."""
     need_wavelength = site.wavelength_mm is None and site.sensor == "nisar"
-    need_window = site.window is None and site.bbox is not None
+    need_window = site.stream and site.window is None and site.bbox is not None
     if not need_wavelength and not need_window:
         return site.wavelength_mm, site.window
 
     wavelength_mm = site.wavelength_mm
     window = site.window
 
-    with _open_remote_h5(ref_target, h5py_mod=h5py_mod, fsspec_mod=fsspec_mod) as ref_hf:
+    with _open_h5_source(ref_source, h5py_mod=h5py_mod, fsspec_mod=fsspec_mod) as ref_hf:
         if need_wavelength:
             freq_hz = _read_center_frequency_hz_from_h5file(ref_hf, subdataset)
             if freq_hz is None:
                 print(
-                    f"Warning: centerFrequency not found in remote header; "
+                    f"Warning: centerFrequency not found in HDF5 header; "
                     f"falling back to {NISAR_DEFAULT_WAVELENGTH_MM:.1f} mm"
                 )
                 wavelength_mm = NISAR_DEFAULT_WAVELENGTH_MM
@@ -1037,7 +1053,7 @@ def _inspect_stream_pair(
                     "pass --window x y w h explicitly."
                 )
             sec_dims: tuple[int, int] | None = None
-            with _open_remote_h5(sec_target, h5py_mod=h5py_mod, fsspec_mod=fsspec_mod) as sec_hf:
+            with _open_h5_source(sec_source, h5py_mod=h5py_mod, fsspec_mod=fsspec_mod) as sec_hf:
                 if subdataset in sec_hf:
                     sh = sec_hf[subdataset].shape
                     sec_dims = (int(sh[1]), int(sh[0]))
@@ -1179,6 +1195,43 @@ def _validate_engine_binary(engine_bin: Path) -> None:
         )
 
 
+def _resolve_pair_endpoint(
+    granule_id: str,
+    local_path: str,
+    site: SiteConfig,
+    cand_by_id: Mapping[str, GranuleCandidate],
+    subdataset: str,
+    *,
+    dry_run: bool,
+) -> tuple[str, Path | StreamTarget, StreamTarget | None] | None:
+    """Resolve a pair input into either a local file path or a streaming GDAL target."""
+    if not str(local_path).startswith("stream://") and Path(local_path).exists():
+        p = Path(local_path)
+        return (str(p), p, None)
+
+    if not site.stream:
+        if dry_run and not str(local_path).startswith("stream://"):
+            p = Path(local_path)
+            return (str(p), p, None)
+        return None
+
+    cand = cand_by_id.get(granule_id)
+    if cand is None or cand.stream_fn is None:
+        return None
+
+    if dry_run:
+        preview_base = cand.stream_url or cand.filename
+        if site.stream_transport == "s3" and preview_base.startswith("s3://"):
+            vsi = f"/vsis3/{preview_base[len('s3://'):]}"
+        else:
+            vsi = f"/vsicurl/{preview_base}"
+        uri = _format_gdal_hdf5_uri(vsi, subdataset)
+        return (uri, Path(local_path), None)
+
+    target = cand.stream_fn(site.stream_transport)
+    return (target.gdal_uri, target, target)
+
+
 def sync_site(
     site: SiteConfig,
     work_dir: Path,
@@ -1188,6 +1241,7 @@ def sync_site(
     asf_mod: Any = None,
     ea_mod: Any = None,
     h5py_mod: Any = None,
+    fsspec_mod: Any = None,
 ) -> SiteRunSummary:
     """Synchronize new granules and process consecutive InSAR pairs for one site."""
     effective_work_dir = site.work_dir or work_dir
@@ -1201,7 +1255,8 @@ def sync_site(
         else effective_work_dir / "products"
     )
     if not dry_run:
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        if not site.stream:
+            raw_dir.mkdir(parents=True, exist_ok=True)
         out_root.mkdir(parents=True, exist_ok=True)
 
     if site.sensor == "opera":
@@ -1214,6 +1269,7 @@ def sync_site(
     candidates.sort(key=lambda c: (c.acq_time, c.granule_id))
     print(f"Found {len(candidates)} granules in window.")
 
+    cand_by_id = {cand.granule_id: cand for cand in candidates}
     db_path = effective_work_dir / "state.db"
     if dry_run and not db_path.exists():
         conn = init_db(":memory:")
@@ -1227,7 +1283,7 @@ def sync_site(
     pending_dry_run_cands: list[GranuleCandidate] = []
 
     try:
-        # 1. Download any unseen (and unpruned) granules
+        # 1. Register streamed granules or download any unseen (and unpruned) granules
         for cand in candidates:
             row = conn.execute(
                 "SELECT local_path, pruned FROM granules WHERE site_id = ? AND granule_id = ?",
@@ -1236,17 +1292,29 @@ def sync_site(
             if row:
                 if row["pruned"]:
                     continue
-                if Path(row["local_path"]).exists():
+                existing_path = str(row["local_path"])
+                if resolved_site.stream and existing_path.startswith("stream://"):
+                    continue
+                if Path(existing_path).exists():
                     continue
 
             if dry_run:
-                print(f"[DRY-RUN] Would download {cand.filename} ({cand.acq_time}) -> {raw_dir}")
+                if resolved_site.stream:
+                    print(
+                        f"[DRY-RUN] Would stream ({resolved_site.stream_transport}) "
+                        f"{cand.filename} ({cand.acq_time})"
+                    )
+                else:
+                    print(f"[DRY-RUN] Would download {cand.filename} ({cand.acq_time}) -> {raw_dir}")
                 pending_dry_run_cands.append(cand)
                 continue
 
-            print(f"Downloading {cand.filename} ({cand.acq_time})...")
-            local_file = cand.download_fn(raw_dir)
-            downloaded_count += 1
+            if resolved_site.stream:
+                local_ref = f"stream://{cand.granule_id}"
+            else:
+                print(f"Downloading {cand.filename} ({cand.acq_time})...")
+                local_ref = str(cand.download_fn(raw_dir))
+                downloaded_count += 1
 
             conn.execute(
                 """
@@ -1258,7 +1326,7 @@ def sync_site(
                     cand.granule_id,
                     cand.stream_key,
                     cand.acq_time,
-                    str(local_file),
+                    local_ref,
                     resolved_site.sensor,
                     resolved_site.site_id,
                     cand.stream_key,
@@ -1306,12 +1374,13 @@ def sync_site(
             for cand in pending_dry_run_cands:
                 if cand.granule_id in seen_ids:
                     continue
+                dry_path = f"stream://{cand.granule_id}" if resolved_site.stream else str(raw_dir / cand.filename)
                 streams.setdefault(cand.stream_key, []).append(
                     {
                         "granule_id": cand.granule_id,
                         "stream_key": cand.stream_key,
                         "acq_time": cand.acq_time,
-                        "local_path": str(raw_dir / cand.filename),
+                        "local_path": dry_path,
                         "pruned": False,
                         "simulated": True,
                     }
@@ -1346,38 +1415,78 @@ def sync_site(
                     pairs_skipped += 1
                     continue
 
-                if not dry_run and (not Path(ref_path).exists() or not Path(sec_path).exists()):
-                    print(f"Skipping {ref_id} -> {sec_id}: missing raw file on disk.")
+                ref_ep = _resolve_pair_endpoint(
+                    ref_id, ref_path, resolved_site, cand_by_id, subdataset, dry_run=dry_run
+                )
+                sec_ep = _resolve_pair_endpoint(
+                    sec_id, sec_path, resolved_site, cand_by_id, subdataset, dry_run=dry_run
+                )
+                if ref_ep is None or sec_ep is None:
+                    reason = "stream granule outside search window" if resolved_site.stream else "missing raw file on disk"
+                    print(f"Skipping {ref_id} -> {sec_id}: {reason}.")
                     pairs_skipped += 1
                     continue
 
+                ref_arg, ref_source, ref_target = ref_ep
+                sec_arg, sec_source, sec_target = sec_ep
                 pair_tag = _build_pair_tag(stream_key, ref_t, sec_t)
                 pair_out = out_root / pair_tag
 
-                wavelength_mm = resolved_site.wavelength_mm
-                if wavelength_mm is None and resolved_site.sensor == "nisar":
-                    if Path(ref_path).exists():
-                        wavelength_mm = read_nisar_wavelength_mm(
-                            Path(ref_path), subdataset, sec_path=Path(sec_path), h5py_mod=h5py_mod
-                        )
-
-                cmd = build_engine_command(
-                    engine_bin=engine_bin,
-                    ref_path=ref_path,
-                    sec_path=sec_path,
-                    out_dir=pair_out,
-                    site=resolved_site,
-                    wavelength_mm=wavelength_mm,
-                )
-
                 if dry_run:
+                    wavelength_mm = resolved_site.wavelength_mm
+                    if wavelength_mm is None and resolved_site.sensor == "nisar" and isinstance(ref_source, Path) and ref_source.exists():
+                        wavelength_mm = read_nisar_wavelength_mm(
+                            ref_source, subdataset, sec_path=sec_source if isinstance(sec_source, Path) else None, h5py_mod=h5py_mod
+                        )
+                    cmd = build_engine_command(
+                        engine_bin=engine_bin,
+                        ref_path=ref_arg,
+                        sec_path=sec_arg,
+                        out_dir=pair_out,
+                        site=resolved_site,
+                        wavelength_mm=wavelength_mm,
+                    )
                     print(f"[DRY-RUN] Would run C++ engine: {pair_tag} ({' '.join(cmd)})")
                     continue
 
+                wavelength_mm, effective_window = _inspect_pair_metadata(
+                    ref_source,
+                    sec_source,
+                    resolved_site,
+                    subdataset,
+                    h5py_mod=h5py_mod,
+                    fsspec_mod=fsspec_mod,
+                )
+                if resolved_site.stream and resolved_site.bbox is not None and effective_window is None:
+                    print(f"Skipping {ref_id} -> {sec_id}: bbox does not overlap granule grid.")
+                    pairs_skipped += 1
+                    continue
+
+                effective_site = (
+                    resolved_site
+                    if effective_window == resolved_site.window
+                    else SiteConfig(**{**resolved_site.__dict__, "window": effective_window})
+                )
+                cmd = build_engine_command(
+                    engine_bin=engine_bin,
+                    ref_path=ref_arg,
+                    sec_path=sec_arg,
+                    out_dir=pair_out,
+                    site=effective_site,
+                    wavelength_mm=wavelength_mm,
+                )
+
                 pair_out.mkdir(parents=True, exist_ok=True)
                 wl_info = f", lambda={wavelength_mm:.3f} mm" if wavelength_mm is not None else ""
-                print(f"Running C++ engine: {pair_tag} (subdataset={subdataset}{wl_info})")
-                subprocess.run(cmd, check=True)
+                win_info = f", window={effective_window}" if effective_window is not None else ""
+                mode_info = " [stream]" if (ref_target or sec_target) else ""
+                print(f"Running C++ engine{mode_info}: {pair_tag} (subdataset={subdataset}{wl_info}{win_info})")
+
+                if ref_target is not None or sec_target is not None:
+                    with _stream_subprocess_env(ref_target, sec_target) as stream_env:
+                        subprocess.run(cmd, check=True, env=stream_env)
+                else:
+                    subprocess.run(cmd, check=True)
                 pairs_processed += 1
 
                 conn.execute(
@@ -1398,10 +1507,13 @@ def sync_site(
                 )
                 conn.commit()
 
-            # 4. Optional disk hygiene: keep latest raw .h5 per stream, prune only forward-paired files
+            # 4. Optional disk hygiene: keep latest raw .h5 per stream, prune only forward-paired local files
             if resolved_site.prune_raw and not dry_run and len(stream_rows) > 1:
                 for old_row in stream_rows[:-1]:
                     old_id = old_row["granule_id"]
+                    old_local = str(old_row["local_path"])
+                    if old_local.startswith("stream://"):
+                        continue
                     paired_forward = conn.execute(
                         """
                         SELECT 1 FROM processed_pairs
@@ -1412,7 +1524,7 @@ def sync_site(
                     if not paired_forward:
                         continue
 
-                    p = Path(old_row["local_path"])
+                    p = Path(old_local)
                     if p.exists():
                         print(f"Pruning processed raw granule: {p.name}")
                         p.unlink()
@@ -1503,6 +1615,13 @@ def _build_site_from_mapping(
     if stride_x <= 0 or stride_y <= 0:
         raise ValueError(f"Site '{site_id}': stride_x and stride_y must be positive")
 
+    stream_transport = str(merged.get("stream_transport", "auto")).strip().lower()
+    if stream_transport not in {"auto", "https", "s3"}:
+        raise ValueError(
+            f"Site '{site_id}': unsupported stream_transport '{stream_transport}'; "
+            "expected 'auto', 'https', or 's3'"
+        )
+
     work_dir_raw = merged.get("work_dir")
     return SiteConfig(
         site_id=site_id,
@@ -1532,6 +1651,8 @@ def _build_site_from_mapping(
         alert_mm=float(merged["alert_mm"]) if merged.get("alert_mm") is not None else None,
         alert_coh=float(merged["alert_coh"]) if merged.get("alert_coh") is not None else None,
         prune_raw=bool(merged.get("prune_raw", False)),
+        stream=bool(merged.get("stream", False)),
+        stream_transport=stream_transport,
         work_dir=Path(work_dir_raw) if work_dir_raw else None,
     )
 
@@ -1637,6 +1758,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alert-mm", type=float, help="Optional displacement alert threshold (mm)")
     parser.add_argument("--alert-coh", type=float, help="Optional minimum coherence for alerts")
     parser.add_argument("--prune-raw", action="store_true", help="Delete older .h5 files once paired")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream HDF5 windows directly via GDAL /vsicurl/ or /vsis3/ without full downloads",
+    )
+    parser.add_argument(
+        "--stream-transport",
+        choices=["auto", "https", "s3"],
+        default="auto",
+        help="Transport for --stream mode (auto picks /vsis3/ in us-west-2, /vsicurl/ elsewhere)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Query catalog and print plan without executing")
     parser.add_argument(
         "--continue-on-error",
@@ -1662,6 +1794,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "alert_mm": args.alert_mm,
             "alert_coh": args.alert_coh,
             "prune_raw": args.prune_raw,
+            "stream": args.stream,
+            "stream_transport": args.stream_transport,
         }
         sites = load_sites_config(args.sites_config, cli_defaults=cli_defaults)
     else:
@@ -1691,6 +1825,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 alert_mm=args.alert_mm,
                 alert_coh=args.alert_coh,
                 prune_raw=args.prune_raw,
+                stream=args.stream,
+                stream_transport=args.stream_transport,
             )
         ]
 

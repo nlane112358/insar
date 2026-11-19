@@ -18,10 +18,15 @@
       "sensor": "nisar",
       "short_name": "NISAR_L2_GSLC_V1",
       "bbox": [-1.85, 53.55, -1.70, 53.68],
+      "track": 153,
+      "frame": 61,
+      "direction": "DESCENDING",
       "subdataset": "/science/LSAR/GSLC/grids/frequencyA/HH",
       "lookback_days": 60,
       "stride_x": 4,
       "stride_y": 4,
+      "stream": true,
+      "stream_transport": "auto",
       "prune_raw": false
     }
   ]

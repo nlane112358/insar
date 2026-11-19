@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -341,6 +342,9 @@ class TestAutoIngestUnit(unittest.TestCase):
         self.assertEqual(sites[0].sensor, "opera")
         self.assertEqual(sites[1].sensor, "nisar")
         self.assertEqual(sites[1].bbox, (-1.85, 53.55, -1.70, 53.68))
+        self.assertEqual(sites[1].track, 153)
+        self.assertEqual(sites[1].frame, 61)
+        self.assertTrue(sites[1].stream)
 
     def test_opera_hyphen_burst_id_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -660,6 +664,247 @@ class TestAutoIngestEndToEnd(unittest.TestCase):
             # Both raw files must remain unpruned on disk for inspection / retry
             self.assertTrue((work_dir / "raw" / f1.name).exists())
             self.assertTrue((work_dir / "raw" / f2.name).exists())
+
+    def test_stream_target_resolution_and_subprocess_env(self) -> None:
+        class _FakeResp:
+            def __init__(self, url: str) -> None:
+                self.url = url
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def raise_for_status(self) -> None:
+                pass
+
+        class _FakeSession:
+            def __init__(self, final_url: str) -> None:
+                self._final_url = final_url
+            def get(self, url: str, **kwargs):
+                return _FakeResp(self._final_url)
+
+        class _FakeGranule(dict):
+            def data_links(self, access: str = "external"):
+                if access == "direct":
+                    return ["s3://nisar-prod-bucket/path/frame.h5"]
+                return ["https://nisar.asf.earthdatacloud.nasa.gov/frame.h5"]
+            def get_s3_credentials_endpoint(self):
+                return "https://nisar.asf.earthdatacloud.nasa.gov/s3credentials"
+
+        g = _FakeGranule({"umm": {"GranuleUR": "G_STREAM"}, "meta": {"provider-id": "ASF"}})
+
+        # 1. Redirected CloudFront/S3 pre-signed URL must NOT receive Bearer header
+        auth_redirect = SimpleNamespace(
+            authenticated=True,
+            token={"access_token": "edl_tok_123"},
+            get_session=lambda: _FakeSession("https://d1mv8.cloudfront.net/s3-abc/frame.h5?Signature=xyz"),
+        )
+        t_redir = ai._resolve_earthaccess_stream_target(
+            g, SimpleNamespace(), lambda: auth_redirect, ai.NISAR_DEFAULT_SUBDATASET, "https"
+        )
+        self.assertEqual(t_redir.transport, "https")
+        self.assertIsNone(t_redir.bearer_token)
+        self.assertTrue(t_redir.gdal_uri.startswith('HDF5:"/vsicurl/https://d1mv8.cloudfront.net/'))
+        self.assertTrue(t_redir.gdal_uri.endswith('://science/LSAR/GSLC/grids/frequencyA/HH'))
+
+        # 2. Unredirected URL keeps bearer token and writes temporary GDAL_HTTP_HEADER_FILE
+        auth_direct = SimpleNamespace(
+            authenticated=True,
+            token={"access_token": "edl_tok_123"},
+            get_session=lambda: _FakeSession("https://nisar.asf.earthdatacloud.nasa.gov/frame.h5"),
+        )
+        t_direct = ai._resolve_earthaccess_stream_target(
+            g, SimpleNamespace(), lambda: auth_direct, ai.NISAR_DEFAULT_SUBDATASET, "https"
+        )
+        self.assertEqual(t_direct.bearer_token, "edl_tok_123")
+        with ai._stream_subprocess_env(t_direct, t_direct) as env:
+            hdr_file = Path(env["GDAL_HTTP_HEADER_FILE"])
+            self.assertTrue(hdr_file.is_file())
+            self.assertIn("Authorization: Bearer edl_tok_123", hdr_file.read_text(encoding="utf-8"))
+            self.assertEqual(env["VSI_CACHE"], "FALSE")
+            self.assertEqual(env["CPL_VSIL_CURL_USE_HEAD"], "NO")
+        self.assertFalse(hdr_file.exists())
+
+        # 3. In-region S3 auto-selection produces /vsis3/ URI and temporary AWS_* credentials
+        auth_s3 = SimpleNamespace(
+            authenticated=True,
+            get_s3_credentials=lambda **kw: {
+                "accessKeyId": "AKIA_TEST",
+                "secretAccessKey": "SECRET_TEST",
+                "sessionToken": "SESS_TEST",
+            },
+        )
+        ea_in_region = SimpleNamespace(__store__=SimpleNamespace(in_region=True))
+        t_s3 = ai._resolve_earthaccess_stream_target(
+            g, ea_in_region, lambda: auth_s3, ai.NISAR_DEFAULT_SUBDATASET, "auto"
+        )
+        self.assertEqual(t_s3.transport, "s3")
+        self.assertEqual(
+            t_s3.gdal_uri,
+            'HDF5:"/vsis3/nisar-prod-bucket/path/frame.h5"://science/LSAR/GSLC/grids/frequencyA/HH',
+        )
+        with ai._stream_subprocess_env(t_s3, t_s3) as env_s3:
+            self.assertEqual(env_s3["AWS_ACCESS_KEY_ID"], "AKIA_TEST")
+            self.assertEqual(env_s3["AWS_SESSION_TOKEN"], "SESS_TEST")
+
+    def test_bbox_to_window_projection_and_clamping(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            h5_path = Path(td) / "nisar_grid.h5"
+            nx, ny = 2000, 4000
+            with h5py.File(h5_path, "w") as f:
+                g = f.require_group("/science/LSAR/GSLC/grids/frequencyA")
+                # UTM Zone 30N covering part of West Yorkshire
+                g.create_dataset("xCoordinates", data=570005.0 + np.arange(nx) * 10.0)
+                g.create_dataset("yCoordinates", data=5955997.5 - np.arange(ny) * 5.0)
+                proj = g.create_dataset("projection", data=np.int64(32630))
+                proj.attrs["epsg_code"] = np.int64(32630)
+                g.create_dataset("centerFrequency", data=np.float64(1.229e9))
+
+            with h5py.File(h5_path, "r") as hf:
+                grid = ai._read_grid_geometry_from_h5file(hf, "/science/LSAR/GSLC/grids/frequencyA/HH")
+            self.assertIsNotNone(grid)
+            win = ai.compute_window_from_bbox((-1.85, 53.55, -1.70, 53.68), grid)
+            self.assertIsNotNone(win)
+            x, y, w, h = win
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            self.assertGreater(w, 0)
+            self.assertGreater(h, 0)
+            self.assertLessEqual(x + w, nx)
+            self.assertLessEqual(y + h, ny)
+
+            # Non-overlapping bbox must return None
+            disjoint = ai.compute_window_from_bbox((10.0, 10.0, 11.0, 11.0), grid)
+            self.assertIsNone(disjoint)
+
+    def test_streaming_mode_sync_site_zero_download_and_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            src_dir = td_path / "remote_h5"
+            work_dir = td_path / "work_stream"
+            nx, ny = 64, 64
+
+            def _make_nisar_h5(p: Path, phase: float) -> Path:
+                _write_complex_h5(
+                    p,
+                    "/science/LSAR/GSLC/grids/frequencyA/HH",
+                    width=nx,
+                    height=ny,
+                    phase_rad=phase,
+                    center_freq_hz=1.229e9,
+                )
+                with h5py.File(p, "a") as f:
+                    g = f["/science/LSAR/GSLC/grids/frequencyA"]
+                    g["HH"].attrs["grid_mapping"] = b"projection"
+                    xc = g.create_dataset("xCoordinates", data=578005.0 + np.arange(nx) * 10.0)
+                    xc.attrs["standard_name"] = b"projection_x_coordinate"
+                    xc.attrs["units"] = b"m"
+                    yc = g.create_dataset("yCoordinates", data=5946997.5 - np.arange(ny) * 5.0)
+                    yc.attrs["standard_name"] = b"projection_y_coordinate"
+                    yc.attrs["units"] = b"m"
+                    proj = g.create_dataset("projection", data=np.int64(32630))
+                    proj.attrs["epsg_code"] = np.int64(32630)
+                    proj.attrs["spatial_ref"] = b"EPSG:32630"
+                return p
+
+            h1 = _make_nisar_h5(src_dir / "n1.h5", 0.1)
+            h2 = _make_nisar_h5(src_dir / "n2.h5", 0.5)
+            url_map = {
+                "https://remote.example/n1.h5": h1,
+                "https://remote.example/n2.h5": h2,
+            }
+
+            class _FakeStreamGranule(dict):
+                def __init__(self, ur: str, start: str, url: str) -> None:
+                    super().__init__(
+                        {
+                            "meta": {"concept-id": ur, "provider-id": "ASF"},
+                            "umm": {
+                                "GranuleUR": ur,
+                                "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": start}},
+                                "AdditionalAttributes": [
+                                    {"Name": "TRACK_NUMBER", "Values": ["153"]},
+                                    {"Name": "FRAME_NUMBER", "Values": ["61"]},
+                                    {"Name": "ASCENDING_DESCENDING", "Values": ["DESCENDING"]},
+                                ],
+                            },
+                        }
+                    )
+                    self._url = url
+                def data_links(self, access: str = "external"):
+                    return [self._url] if access == "external" else []
+
+            class _FakeStreamSession:
+                def get(self, url: str, **kwargs):
+                    return contextlib.nullcontext(SimpleNamespace(url=url, raise_for_status=lambda: None))
+
+            class _FakeStreamEA:
+                def login(self, strategy: str = "all"):
+                    return SimpleNamespace(
+                        authenticated=True,
+                        token={"access_token": "tok"},
+                        get_session=lambda: _FakeStreamSession(),
+                    )
+                def search_data(self, **kwargs):
+                    return [
+                        _FakeStreamGranule("NISAR_L2_PR_GSLC_033_153_D_061_20261022", "2026-10-22T19:38:41Z", "https://remote.example/n1.h5"),
+                        _FakeStreamGranule("NISAR_L2_PR_GSLC_034_153_D_061_20261103", "2026-11-03T19:38:42Z", "https://remote.example/n2.h5"),
+                    ]
+                def download(self, *args, **kwargs):
+                    raise AssertionError("download() must not be called in stream=True mode")
+
+            fake_fsspec = SimpleNamespace(
+                filesystem=lambda proto, **kw: SimpleNamespace(
+                    open=lambda url, mode="rb", **okw: open(url_map[url], mode)
+                )
+            )
+            site = ai.SiteConfig(
+                site_id="yorkshire_stream",
+                sensor="nisar",
+                bbox=(-1.85, 53.55, -1.70, 53.68),
+                stride_x=2,
+                stride_y=2,
+                stream=True,
+                stream_transport="https",
+            )
+
+            captured_cmds: list[tuple[list[str], dict[str, str]]] = []
+            real_run = ai.subprocess.run
+
+            def _intercept_run(cmd, *args, **kwargs):
+                if str(cmd[0]) == str(ENGINE_BIN):
+                    captured_cmds.append((list(cmd), dict(kwargs.get("env") or {})))
+                    # Substitute local HDF5 files into real insar_proto to avoid TCP socket inside sandbox
+                    local_cmd = list(cmd)
+                    local_cmd[local_cmd.index("--slc1") + 1] = f'HDF5:"{h1}"://science/LSAR/GSLC/grids/frequencyA/HH'
+                    local_cmd[local_cmd.index("--slc2") + 1] = f'HDF5:"{h2}"://science/LSAR/GSLC/grids/frequencyA/HH'
+                    return real_run(local_cmd, *args, **{k: v for k, v in kwargs.items() if k != "env"})
+                return real_run(cmd, *args, **kwargs)
+
+            with patch.object(ai.subprocess, "run", side_effect=_intercept_run):
+                sum1 = ai.sync_site(
+                    site, work_dir, ENGINE_BIN, ea_mod=_FakeStreamEA(), fsspec_mod=fake_fsspec
+                )
+                sum2 = ai.sync_site(
+                    site, work_dir, ENGINE_BIN, ea_mod=_FakeStreamEA(), fsspec_mod=fake_fsspec
+                )
+
+            self.assertEqual(sum1.downloaded_count, 0)
+            self.assertEqual(sum1.pairs_processed, 1)
+            self.assertEqual(sum2.pairs_processed, 0)
+            self.assertEqual(sum2.pairs_skipped, 1)
+            self.assertFalse((work_dir / "raw" / "yorkshire_stream").exists())
+            self.assertEqual(len(captured_cmds), 1)
+            cmd, env = captured_cmds[0]
+            self.assertIn('HDF5:"/vsicurl/https://remote.example/n1.h5"://science/LSAR/GSLC/grids/frequencyA/HH', cmd)
+            self.assertIn("--window", cmd)
+            self.assertEqual(env["VSI_CACHE"], "FALSE")
+            self.assertEqual(env["GDAL_SKIP"], "NETCDF")
+
+            pair_dir = work_dir / "products" / "yorkshire_stream" / "NISAR_T153_F061_D_2026-10-22_2026-11-03"
+            self.assertTrue((pair_dir / "displacement_mm.tif").is_file())
+            summary_json = json.loads((pair_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary_json["width"], 32)
+            self.assertEqual(summary_json["height"], 32)
 
 
 if __name__ == "__main__":
