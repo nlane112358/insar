@@ -1,1 +1,0 @@
-/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/insar_proto.dir/src/insar_engine_cpu.cpp.o -o insar_proto  /opt/homebrew/Cellar/gdal/3.13.3_6/lib/libgdal.dylib /opt/homebrew/opt/libomp/lib/libomp.dylib

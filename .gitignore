@@ -1,9 +1,66 @@
+# Python
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
+*$py.class
+*.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# C++ / CMake build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# InSAR runtime outputs, data directories & satellite granules
+api_data/
+out/
+out_synth/
 insar_work/
 mexico_city_run/
 nisar_raw/
+nisar_run/
+*.f32
+*.slc
+*.h5
+*.hdf5
+*.nc
+*.tif
+*.tiff
+*.tif.aux.xml
+*.png.aux.xml
+*.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Secrets & local environment
+.env
+.env.*
+!.env.example
+.netrc
+
+# OS & editors
+.DS_Store
+._.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
