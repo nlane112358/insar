@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Backward-compatible CLI shim for the platform DEM provider."""
+"""Forward-only CLI shim for `insar_platform.providers.cop30_dem`."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_PY_ROOT = Path(__file__).resolve().parents[1] / "python"
+if str(_PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PY_ROOT))
 
-from services.platform.catalog import dem_service as _implementation  # noqa: E402
+from insar_platform.providers.cop30_dem import *  # noqa: E402,F401,F403
+from insar_platform.providers.cop30_dem import main  # noqa: E402
 
 if __name__ == "__main__":
-    raise SystemExit(_implementation.main())
-
-sys.modules[__name__] = _implementation
+    raise SystemExit(main())

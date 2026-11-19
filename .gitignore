@@ -27,6 +27,7 @@ compile_commands.json
 *.exe
 
 # InSAR runtime outputs, data directories & satellite granules
+var/
 api_data/
 out/
 out_synth/

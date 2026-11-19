@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpp-and-python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build and GDAL dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libgdal-dev gdal-bin \
+            python3-dev python3-gdal python3-h5py python3-matplotlib python3-numpy
+
+      - name: Install Python runtime requirements
+        run: |
+          python3 -m pip install --break-system-packages -r deploy/requirements.txt
+
+      - name: Configure, build, and test C++ engine and stacker
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DINSAR_NATIVE_ARCH=OFF
+          cmake --build build -j2
+          ctest --test-dir build --output-on-failure
+
+      - name: Run Python unit and integration tests
+        env:
+          PYTHONPATH: python:/usr/lib/python3/dist-packages
+        run: |
+          python3 -m unittest discover -s tests -v

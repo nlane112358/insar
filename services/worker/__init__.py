@@ -1,1 +1,0 @@
-"""Stateless worker process package."""

@@ -33,8 +33,11 @@ reports = [
 ]
 
 [project.scripts]
-insarctl = "cli.insarctl:main"
+insarctl = "insar_platform.cli.insarctl:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["services*", "api*", "cli*", "scripts*"]
+where = ["python"]
+include = ["insar_platform*"]
+
+[tool.setuptools.package-data]
+insar_platform = ["api/templates/*.html"]

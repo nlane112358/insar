@@ -1,5 +1,7 @@
 # insar-cpu-proto
 
+Ground Stability & Structural Risk API
+
 Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stacking engine for Sentinel-1 (OPERA CSLC-S1) and NISAR (L-band GSLC) radar imagery. Converts coregistered complex SLC pairs into calibrated millimeter-scale line-of-sight (LOS) deformation rasters, Cloud-Optimized GeoTIFFs, STAC 1.1.0 items, and SNR/maturity-gated linear infrastructure corridor risk alerts.
 
 ---
@@ -43,7 +45,7 @@ Native C++20 + OpenMP InSAR processing and sequential $O(1)$ time-series stackin
 
 ### Single-Pair Diagnostics (`insar_proto`)
 
-![NISAR InSAR Output Preview](nisar_preview.png)
+![NISAR InSAR Output Preview](docs/figures/nisar_preview.png)
 
 *Pair-level outputs for `NISAR_T052_F061_D_2026-10-27_2026-11-08`: wrapped interferometric phase $\psi \in [-\pi, \pi]$, spatial coherence $\gamma \in [0, 1]$, and unwrapped LOS displacement (mm) with high-coherence anomaly alerts.*
 
@@ -81,7 +83,7 @@ The replay reads settings from `stack_ledger.json`, writes the static panel and 
 Install the optional scientific colormaps and GIF writer with:
 
 ```bash
-python3 -m pip install -r scripts/requirements-plot.txt
+python3 -m pip install -r deploy/requirements-plot.txt
 ```
 
 The diverging maps fall back to the built-in palette if `cmcrameri` is unavailable. GIF export requires Pillow; use an `.mp4` output path when FFmpeg is installed.
@@ -133,17 +135,18 @@ Each HTML embeds its stack COGs and feature data for building-scale zoom and cor
 
 | Component | Path | Role |
 | :--- | :--- | :--- |
-| **Shared C++ Core** | [`include/insar/`](include/insar) · [`src/`](src) · [`bindings/python_module.cpp`](bindings/python_module.cpp) | `libinsar` shared library with pairwise and stack APIs; nanobind runs the full applications in-process and exposes a zero-copy CPU NumPy/DLPack interferogram kernel |
-| **Online Stacker** | [`src/stack/`](src/stack) · `insar_stack` | $O(1)$ per-pass updates to a 13-band Float64 sufficient-statistics raster (`stack_state.tif`), connected-component reference pinning, explicit/two-pass high-deformation masking, joint robust polynomial + DEM tropospheric regression (`--dem`), skip-1/skip-2 triplet phase closure masking & corrupted-pair rejection, velocity/uncertainty/SNR/acceleration COGs, and SNR + stack-maturity gated corridor risk analytics |
-| **Platform Domain Services** | [`services/platform/`](services/platform) | Provider adapters, ingestion and stack services, GNSS validation, STAC builders, object storage, database, and durable workflow boundaries; legacy `scripts/` commands remain compatibility shims |
-| **Control Plane** | [`api/server.py`](api/server.py) | FastAPI monitor/job/stack APIs, PostGIS spatial screening, STAC catalog, S3 range reads, API key checks, and transactional outbox enqueueing |
-| **Compute Plane** | [`services/worker/`](services/worker) · [`services/platform/workflows/`](services/platform/workflows) | Celery workers execute typed ingestion, pairwise, and stack tasks; Redis-backed scheduling retries work after transient failures |
-| **State & Artifacts** | [`services/platform/storage/`](services/platform/storage) · [`docker-compose.yml`](docker-compose.yml) | PostGIS is the system of record; MinIO/S3 stores artifact objects and checksums; SQLite/filesystem mode remains available for a standalone developer run |
-| **DEM & GNSS Validation** | [`services/platform/catalog/dem_service.py`](services/platform/catalog/dem_service.py) · [`services/platform/validation/`](services/platform/validation) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation (`--gnss-frame auto\|NA\|EU`, `--look-direction auto\|right\|left`) with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
-| **UK Corridors & Sectors** | [`scripts/fetch_corridors.py`](scripts/fetch_corridors.py) · [`scripts/uk_sector_analytics.py`](scripts/uk_sector_analytics.py) | Overpass UK rail/AMP8 water/transport corridor presets (`london_thames`, `east_midlands_coalfields`), ONS May 2024 UK Local Authority District boundaries (`--zones-preset`), and sector/insurance rollups |
-| **Cartography** | [`scripts/plots/plot_raster_map.py`](scripts/plots/plot_raster_map.py) · [`scripts/plots/plot_uk_sites.py`](scripts/plots/plot_uk_sites.py) · [`scripts/plots/plot_extended_visualizations.py`](scripts/plots/plot_extended_visualizations.py) · [`scripts/plots/plot_stack_evolution.py`](scripts/plots/plot_stack_evolution.py) | Standalone raster maps, UK sector dashboards, triplet closure & Asc/Desc track comparisons, corridor heatmaps, confidence diagnostics, GNSS residuals, transects, and replayed stack evolution panels |
-| **Interactive Maps** | [`scripts/plots/export_interactive_map.py`](scripts/plots/export_interactive_map.py) · [`api/server.py`](api/server.py) | Embedded-COG reports with basemap toggle, opacity and swipe controls, clickable corridor/GNSS charts, and live job previews at `/preview/{job_id}` |
-| **Operator CLI** | [`cli/insarctl.py`](cli/insarctl.py) | Thin commands for Compose lifecycle, health and screening queries, monitor sync, and legacy local scientific commands |
+| **Shared C++ Core** | [`cpp/include/insar/`](cpp/include/insar) · [`cpp/src/`](cpp/src) · [`cpp/bindings/python_module.cpp`](cpp/bindings/python_module.cpp) | `libinsar` shared library with pairwise and stack APIs; nanobind runs the full applications in-process and exposes a zero-copy CPU NumPy/DLPack interferogram kernel |
+| **Online Stacker** | [`cpp/src/stack/`](cpp/src/stack) · `insar_stack` | $O(1)$ per-pass updates to a 13-band Float64 sufficient-statistics raster (`stack_state.tif`), connected-component reference pinning, explicit/two-pass high-deformation masking, joint robust polynomial + DEM tropospheric regression (`--dem`), skip-1/skip-2 triplet phase closure masking & corrupted-pair rejection, velocity/uncertainty/SNR/acceleration COGs, and SNR + stack-maturity gated corridor risk analytics |
+| **Platform Domain Services** | [`python/insar_platform/`](python/insar_platform) | Installable Python package organizing `domain/`, `providers/`, `pipelines/`, `publishing/`, `storage/`, `workflows/`, and compatibility `scripts/` CLI shims |
+| **Control Plane** | [`python/insar_platform/api/`](python/insar_platform/api) | Modular FastAPI `app.py` and `routes/` for monitor/job/stack APIs, PostGIS spatial screening, STAC catalog, S3 range reads, API key checks, and transactional outbox enqueueing |
+| **Compute Plane** | [`python/insar_platform/worker/`](python/insar_platform/worker) · [`python/insar_platform/workflows/`](python/insar_platform/workflows) | Celery workers execute typed ingestion, pairwise, and stack tasks; Redis-backed scheduling retries work after transient failures |
+| **State & Artifacts** | [`python/insar_platform/storage/`](python/insar_platform/storage) · [`deploy/docker-compose.yml`](deploy/docker-compose.yml) | PostGIS is the system of record; MinIO/S3 stores artifact objects and checksums; SQLite/filesystem mode (`var/api_data/`) remains available for a standalone developer run |
+| **DEM & GNSS Validation** | [`python/insar_platform/providers/`](python/insar_platform/providers) · [`python/insar_platform/pipelines/gnss_validation.py`](python/insar_platform/pipelines/gnss_validation.py) | Copernicus GLO-30 COG tile fetch/alignment and UNR/NGL GNSS LOS ground-truth validation (`--gnss-frame auto\|NA\|EU`, `--look-direction auto\|right\|left`) with exact zero-Doppler orbit projection and standalone map, scatter, and time-series figures |
+| **UK Corridors & Sectors** | [`python/insar_platform/providers/osm_corridors.py`](python/insar_platform/providers/osm_corridors.py) · [`python/insar_platform/pipelines/uk_sectors.py`](python/insar_platform/pipelines/uk_sectors.py) | Overpass UK rail/AMP8 water/transport corridor presets (`london_thames`, `east_midlands_coalfields`), ONS May 2024 UK Local Authority District boundaries (`--zones-preset`), and sector/insurance rollups |
+| **Cartography** | [`python/insar_platform/viz/`](python/insar_platform/viz) · [`scripts/plots/`](scripts/plots) | Standalone raster maps, UK sector dashboards, triplet closure & Asc/Desc track comparisons, corridor heatmaps, confidence diagnostics, GNSS residuals, transects, and replayed stack evolution panels |
+| **Interactive Maps** | [`python/insar_platform/viz/interactive_map.py`](python/insar_platform/viz/interactive_map.py) · [`python/insar_platform/api/templates/job_preview.html`](python/insar_platform/api/templates/job_preview.html) | Embedded-COG reports with basemap toggle, opacity and swipe controls, clickable corridor/GNSS charts, and live job previews at `/preview/{job_id}` |
+| **Operator CLI & SDK** | [`python/insar_platform/cli/insarctl.py`](python/insar_platform/cli/insarctl.py) · [`python/insar_platform/client/http.py`](python/insar_platform/client/http.py) · [`examples/sdk_demo.py`](examples/sdk_demo.py) | `insarctl` commands for Compose lifecycle, health and screening queries, monitor sync, and local workflows, plus `InsarClient` SDK and runnable demo |
+| **Configs & Runtime State** | [`configs/sites.example.json`](configs/sites.example.json) · `var/` | Checked-in multi-site presets and gitignored local scratch/work directories (`var/work/`, `var/api_data/`, `var/out/`) |
 
 ---
 
@@ -158,7 +161,7 @@ The Compose stack starts PostGIS, Redis, MinIO, the API, a C++ compute worker, a
 ```bash
 cp .env.example .env
 set -a; source .env; set +a
-docker compose up -d --build
+docker compose -f deploy/docker-compose.yml up -d --build
 python3 -m pip install -e .
 insarctl health
 ```
@@ -195,19 +198,19 @@ python3 -m unittest discover -s tests -v
 ./build/insar_proto \
   --slc1 ref.h5 --slc2 sec.h5 \
   --ref-lonlat -99.215 19.420 --ref-radius-m 1000 \
-  --out-dir out_pair
+  --out-dir var/out/pair
 
 # 2. Fetch and align Copernicus GLO-30 DEM to the InSAR stack grid
 python3 scripts/fetch_dem.py \
-  --target-raster out_pair/displacement_mm.tif \
-  --out insar_work/dem/site_cop30.tif
+  --ref-raster var/out/pair/displacement_mm.tif \
+  --out var/work/dem/site_cop30.tif
 
 # 3. Incrementally update a multi-pass stack (DEM tropo + reference pin + 2-pass deform mask
 #    + automatic triplet closure when skip-1/skip-2 pairs exist + SNR/maturity corridor gating)
 python3 scripts/stack_timeseries.py \
-  --products-dir insar_work/products/mexico_city_iw1 \
-  --out-dir insar_work/stacks/mexico_city_iw1 \
-  --dem insar_work/dem/mexico_city_iw1_cop30.tif \
+  --products-dir var/work/products/mexico_city_iw1 \
+  --out-dir var/work/stacks/mexico_city_iw1 \
+  --dem var/work/dem/mexico_city_iw1_cop30.tif \
   --ref-lonlat -99.215 19.420 --ref-radius-m 1000 \
   --ramp-order 0 --two-pass-deform-mask \
   --corridors data/corridors/mexico_city_corridors.geojson \
@@ -215,10 +218,10 @@ python3 scripts/stack_timeseries.py \
 
 # 4. Validate against UNR/NGL GNSS stations and render standalone benchmark figures
 python3 scripts/validate_gnss.py \
-  --stack-dir insar_work/stacks/mexico_city_iw1 \
-  --products-dir insar_work/products/mexico_city_iw1 \
-  --dem insar_work/dem/mexico_city_iw1_cop30.tif \
-  --slc-h5 insar_work/raw/mexico_city_iw1 \
+  --stack-dir var/work/stacks/mexico_city_iw1 \
+  --products-dir var/work/products/mexico_city_iw1 \
+  --dem var/work/dem/mexico_city_iw1_cop30.tif \
+  --slc-h5 var/work/raw/mexico_city_iw1 \
   --out-json data/validation/mexico_city_gnss_validation.json \
   --map-out docs/figures/mexico_city_gnss_map.png \
   --scatter-out docs/figures/mexico_city_gnss_scatter.png \
@@ -226,19 +229,19 @@ python3 scripts/validate_gnss.py \
 
 # 5. Render a standalone cartographic velocity map
 python3 scripts/plots/plot_raster_map.py \
-  --stack-dir insar_work/stacks/mexico_city_iw1 \
+  --stack-dir var/work/stacks/mexico_city_iw1 \
   --layer velocity --focus-urban
 
 # 6. Export standalone interactive maps (raster and vector payloads are embedded in each HTML)
 python3 scripts/plots/export_interactive_map.py \
   --site-name "Mexico City · Sentinel-1 C-band" \
-  --stack-dir insar_work/stacks/mexico_city_iw1 \
+  --stack-dir var/work/stacks/mexico_city_iw1 \
   --corridors data/corridors/mexico_city_corridors.geojson \
   --gnss-json data/validation/mexico_city_gnss_validation.json \
   --output docs/interactive/mexico_city.html
 python3 scripts/plots/export_interactive_map.py \
   --site-name "West Yorkshire · NISAR L-band" \
-  --stack-dir insar_work/stacks/west_yorkshire_t052 \
+  --stack-dir var/work/stacks/west_yorkshire_t052 \
   --corridors data/corridors/west_yorkshire_corridors.geojson \
   --output docs/interactive/west_yorkshire.html
 
@@ -246,11 +249,11 @@ python3 scripts/plots/export_interactive_map.py \
 python3 scripts/fetch_corridors.py --preset london_thames --balance-classes --max-features 80 --out data/corridors/london_thames_corridors.geojson
 python3 scripts/fetch_corridors.py --zones-preset london_thames --out data/zones/london_thames_zones.geojson
 .venv/bin/python scripts/auto_ingest.py \
-  --sites-config scripts/sites.example.json \
+  --sites-config configs/sites.example.json \
   --site-id london_thames_nisar,london_east_nisar_t173,east_midlands_coalfields_nisar,east_midlands_coalfields_t052 \
   --continue-on-error
 python3 scripts/uk_sector_analytics.py \
-  --stack-dir insar_work/stacks/london_thames_nisar \
+  --stack-dir var/work/stacks/london_thames_nisar \
   --profile london_thames \
   --zones data/zones/london_thames_zones.geojson \
   --out-json data/validation/london_thames_sector_report.json \
@@ -260,7 +263,7 @@ python3 scripts/plots/plot_uk_sites.py dashboard \
   --report-json data/validation/london_thames_sector_report.json \
   --out docs/figures/london_thames_sector_dashboard.png
 python3 scripts/validate_gnss.py \
-  --stack-dir insar_work/stacks/london_thames_nisar \
+  --stack-dir var/work/stacks/london_thames_nisar \
   --gnss-frame EU --look-direction left --incidence-deg 40.79 --heading-deg -22.426 \
   --out-json data/validation/london_thames_gnss_validation.json \
   --out-csv data/validation/london_thames_gnss_validation.csv
@@ -272,10 +275,10 @@ The reports provide satellite/dark basemap selection, raster opacity, a velocity
 
 ```bash
 # Run locally (serves both /v1/jobs via insar_proto and /v1/stacks/{stack_id}/updates via insar_stack)
-uvicorn api.server:app --host 0.0.0.0 --port 8000
+PYTHONPATH=python uvicorn insar_platform.api.app:app --host 0.0.0.0 --port 8000
 
 # The API image is intended to run with the worker and durable services via Compose.
-docker compose up -d --build
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
 Key endpoints: `GET /health`, `GET /v1/admin/usage`, `POST /v1/monitors`, `POST /v1/monitors/{monitor_name}/sync`, `GET /v1/ingestions/{ingestion_id}`, `POST /v1/jobs`, `GET /v1/jobs/{job_id}`, `GET /preview/{job_id}`, `GET /stac/items/{job_id}`, `POST /v1/stacks/{stack_id}/updates`, `GET /v1/stacks`, `GET /v1/stacks/{stack_id}`, `GET /stac/stacks/{stack_id}`, `GET /assets/{job_id}/{file}`, and `GET /stack-assets/{stack_id}/{file}`. The `POST /v1/jobs` response includes a `preview_url` immediately, including while the job is queued.

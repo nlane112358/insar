@@ -23,23 +23,28 @@ find_package(OpenMP)
 find_package(GDAL REQUIRED)
 
 add_library(libinsar SHARED
-    src/core/types.cpp
-    src/math/fft.cpp
-    src/engine/preconditioner.cpp
-    src/engine/interferogram_estimator.cpp
-    src/engine/weighted_laplacian.cpp
-    src/engine/phase_unwrapper.cpp
-    src/engine/phase_calibrator.cpp
-    src/engine/cpu_insar_engine.cpp
-    src/io/gdal_utils.cpp
-    src/io/gdal_slc_source.cpp
-    src/io/cog_writer.cpp
-    src/io/product_exporter.cpp
-    src/analytics/anomaly_detector.cpp
-    src/app/cli_options.cpp
-    src/app/command_runner.cpp
-    src/app/insar_application.cpp
-    src/stack/stack_application.cpp
+    cpp/src/core/types.cpp
+    cpp/src/math/fft.cpp
+    cpp/src/engine/preconditioner.cpp
+    cpp/src/engine/interferogram_estimator.cpp
+    cpp/src/engine/weighted_laplacian.cpp
+    cpp/src/engine/phase_unwrapper.cpp
+    cpp/src/engine/phase_calibrator.cpp
+    cpp/src/engine/cpu_insar_engine.cpp
+    cpp/src/io/gdal_utils.cpp
+    cpp/src/io/gdal_slc_source.cpp
+    cpp/src/io/cog_writer.cpp
+    cpp/src/io/product_exporter.cpp
+    cpp/src/analytics/anomaly_detector.cpp
+    cpp/src/app/cli_options.cpp
+    cpp/src/app/command_runner.cpp
+    cpp/src/app/insar_application.cpp
+    cpp/src/stack/stack_io.cpp
+    cpp/src/stack/closure.cpp
+    cpp/src/stack/nuisance.cpp
+    cpp/src/stack/normal_equations.cpp
+    cpp/src/stack/corridors.cpp
+    cpp/src/stack/stack_application.cpp
 )
 
 add_library(insar_core ALIAS libinsar)
@@ -51,7 +56,7 @@ set_target_properties(libinsar PROPERTIES
 
 target_include_directories(libinsar
     PUBLIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cpp/include"
 )
 
 target_compile_features(libinsar PUBLIC cxx_std_20)
@@ -78,7 +83,7 @@ else()
     elseif(INSAR_NATIVE_ARCH)
         check_cxx_compiler_flag("-march=native" HAS_MARCH_NATIVE)
         if(HAS_MARCH_NATIVE)
-                target_compile_options(libinsar PUBLIC -march=native)
+            target_compile_options(libinsar PUBLIC -march=native)
         else()
             check_cxx_compiler_flag("-mcpu=native" HAS_MCPU_NATIVE)
             if(HAS_MCPU_NATIVE)
@@ -88,10 +93,10 @@ else()
     endif()
 endif()
 
-add_executable(insar_proto src/main.cpp)
+add_executable(insar_proto cpp/src/main.cpp)
 target_link_libraries(insar_proto PRIVATE libinsar)
 
-add_executable(insar_stack src/stack_main.cpp)
+add_executable(insar_stack cpp/src/stack_main.cpp)
 target_link_libraries(insar_stack PRIVATE libinsar)
 
 if(INSAR_BUILD_PYTHON)
@@ -106,17 +111,24 @@ if(INSAR_BUILD_PYTHON)
         message(FATAL_ERROR "Unable to locate nanobind. Install it with: ${Python_EXECUTABLE} -m pip install nanobind")
     endif()
     find_package(nanobind CONFIG REQUIRED)
-    nanobind_add_module(_insar_core bindings/python_module.cpp)
+    nanobind_add_module(_insar_core cpp/bindings/python_module.cpp)
     target_link_libraries(_insar_core PRIVATE libinsar)
-    set_target_properties(_insar_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python")
-    install(TARGETS _insar_core LIBRARY DESTINATION .)
+    set_target_properties(_insar_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python/insar_platform")
+    install(TARGETS _insar_core LIBRARY DESTINATION insar_platform)
 endif()
 
-if(INSAR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/cpp/test_insar_engine.cpp")
+if(INSAR_BUILD_TESTS)
     enable_testing()
-    add_executable(insar_cpp_tests tests/cpp/test_insar_engine.cpp)
-    target_link_libraries(insar_cpp_tests PRIVATE libinsar)
-    add_test(NAME insar_cpp_tests COMMAND insar_cpp_tests)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/test_insar_engine.cpp")
+        add_executable(insar_cpp_tests cpp/tests/test_insar_engine.cpp)
+        target_link_libraries(insar_cpp_tests PRIVATE libinsar)
+        add_test(NAME insar_cpp_tests COMMAND insar_cpp_tests)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/test_stack_engine.cpp")
+        add_executable(insar_stack_tests cpp/tests/test_stack_engine.cpp)
+        target_link_libraries(insar_stack_tests PRIVATE libinsar)
+        add_test(NAME insar_stack_tests COMMAND insar_stack_tests)
+    endif()
 endif()
 
 include(GNUInstallDirs)
@@ -125,4 +137,4 @@ install(TARGETS libinsar insar_proto insar_stack
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY cpp/include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

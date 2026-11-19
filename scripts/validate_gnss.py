@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Backward-compatible CLI shim for the platform GNSS validation service."""
+"""Forward-only CLI shim for `insar_platform.pipelines.gnss_validation`."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_PY_ROOT = Path(__file__).resolve().parents[1] / "python"
+if str(_PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PY_ROOT))
 
-from services.platform.validation import gnss_service as _implementation  # noqa: E402
+from insar_platform.pipelines.gnss_validation import *  # noqa: E402,F401,F403
+from insar_platform.pipelines.gnss_validation import main  # noqa: E402
 
 if __name__ == "__main__":
-    raise SystemExit(_implementation.main())
-
-sys.modules[__name__] = _implementation
+    raise SystemExit(main())

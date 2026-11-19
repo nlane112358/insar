@@ -1,0 +1,133 @@
+name: insar-platform
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-insar}
+      POSTGRES_USER: ${POSTGRES_USER:-insar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insar_local_only}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_local_only}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command: >-
+      until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 2; done;
+      mc mb --ignore-existing local/insar-artifacts;
+      mc version enable local/insar-artifacts
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_local_only}
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: api
+    environment: &platform-env
+      INSAR_TASK_MODE: celery
+      INSAR_STORAGE_BACKEND: s3
+      INSAR_DATABASE_URL: postgresql://${POSTGRES_USER:-insar}:${POSTGRES_PASSWORD:-insar_local_only}@postgres:5432/${POSTGRES_DB:-insar}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CELERY_VISIBILITY_TIMEOUT: ${CELERY_VISIBILITY_TIMEOUT:-172800}
+      INSAR_S3_ENDPOINT_URL: http://minio:9000
+      INSAR_S3_BUCKET: insar-artifacts
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_local_only}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_S3_ENDPOINT: minio:9000
+      AWS_HTTPS: "NO"
+      AWS_VIRTUAL_HOSTING: "FALSE"
+      INSAR_API_KEY: ${INSAR_API_KEY:-insar_dev_secret_key}
+      INSAR_WEBHOOK_SECRET: ${INSAR_WEBHOOK_SECRET:-whsec_local_dev_signing_secret}
+      INSAR_BASE_URL: ${INSAR_BASE_URL:-http://127.0.0.1:8000}
+      INSAR_DATA_DIR: /data
+      EARTHDATA_TOKEN: ${EARTHDATA_TOKEN:-}
+      EARTHDATA_USERNAME: ${EARTHDATA_USERNAME:-}
+      EARTHDATA_PASSWORD: ${EARTHDATA_PASSWORD:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: worker
+    environment:
+      <<: *platform-env
+      INSAR_COMPUTE_BACKEND: libinsar
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: scheduler
+    environment: *platform-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
